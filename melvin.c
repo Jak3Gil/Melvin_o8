@@ -7,58 +7,12 @@
  * - Nodes only know themselves and their edges
  * - All measurements are local (no global state)
  * - Nodes can scale from 1 byte to very large payloads
+ * 
+ * Bootstrap: Creates .m files - the persistent storage format
  */
 
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <stdint.h>
-#include <stdbool.h>
-
-/* ========================================
- * CORE STRUCTURES
- * ======================================== */
-
-/* Edge: Simple connection between two nodes */
-typedef struct Edge {
-    char from_id[9];      /* 8-byte ID string + null terminator */
-    char to_id[9];        /* 8-byte ID string + null terminator */
-    bool direction;       /* true = from->to, false = to->from */
-    bool activation;      /* Binary: 1 or 0 */
-    float weight;         /* Activation history (local measurement) */
-} Edge;
-
-/* Node: Core unit of the system */
-typedef struct Node {
-    char id[9];           /* 8-byte unique ID string + null terminator */
-    
-    /* Payload: actual data storage (flexible size) */
-    uint8_t *payload;     /* Pointer to payload data */
-    size_t payload_size;  /* Size of payload in bytes (can be 1 to very large) */
-    
-    bool activation;      /* Binary: 1 or 0 */
-    float weight;         /* Activation history (local measurement) */
-    
-    /* Edge pointers: nodes only know their edges */
-    Edge **outgoing_edges;  /* Edges where this node is 'from' */
-    size_t outgoing_count;
-    size_t outgoing_capacity;
-    
-    Edge **incoming_edges;  /* Edges where this node is 'to' */
-    size_t incoming_count;
-    size_t incoming_capacity;
-} Node;
-
-/* Graph: Container for nodes and edges (no global state in operations) */
-typedef struct MelvinGraph {
-    Node **nodes;
-    size_t node_count;
-    size_t node_capacity;
-    
-    Edge **edges;
-    size_t edge_count;
-    size_t edge_capacity;
-} MelvinGraph;
+#include "melvin.h"
+#include "melvin_m.h"
 
 /* ========================================
  * UTILITY FUNCTIONS
@@ -74,26 +28,26 @@ void generate_node_id(char *id_buffer) {
  * NODE OPERATIONS (Local Only)
  * ======================================== */
 
-/* Create a new node with payload */
+/* Create a new node with payload (payload stored directly in node) */
 Node* node_create(const uint8_t *payload_data, size_t payload_size) {
-    Node *node = (Node*)calloc(1, sizeof(Node));
+    /* Allocate node with space for payload (flexible array member) */
+    Node *node = (Node*)calloc(1, sizeof(Node) + payload_size);
     if (!node) return NULL;
     
-    /* Generate unique ID */
-    generate_node_id(node->id);
+    /* Generate sequential binary ID (big-endian, 8 bytes) */
+    static uint64_t id_counter = 0;
+    for (int i = 0; i < 8; i++) {
+        node->id[i] = (char)((id_counter >> (8 * (7 - i))) & 0xFF);
+    }
+    node->id[8] = '\0';
+    id_counter++;
     
-    /* Allocate and copy payload */
+    /* Store payload size */
+    node->payload_size = payload_size;
+    
+    /* Copy payload data directly into node (stored inline) */
     if (payload_data && payload_size > 0) {
-        node->payload = (uint8_t*)malloc(payload_size);
-        if (!node->payload) {
-            free(node);
-            return NULL;
-        }
         memcpy(node->payload, payload_data, payload_size);
-        node->payload_size = payload_size;
-    } else {
-        node->payload = NULL;
-        node->payload_size = 0;
     }
     
     /* Initialize state */
@@ -112,18 +66,17 @@ Node* node_create(const uint8_t *payload_data, size_t payload_size) {
     return node;
 }
 
-/* Update node weight based on local activation history */
+/* Update node weight based on local activation history (relative to local context) */
 void node_update_weight_local(Node *node) {
     if (!node) return;
     
-    /* Local measurement: weight is activation history */
-    /* Simple exponential moving average (local to this node) */
-    float alpha = 0.1f;  /* Learning rate (could be made relative later) */
-    if (node->activation) {
-        node->weight = node->weight * (1.0f - alpha) + 1.0f * alpha;
-    } else {
-        node->weight = node->weight * (1.0f - alpha) + 0.0f * alpha;
-    }
+    /* Learning rate relative to node's current weight and local edge averages */
+    float local_avg = (node_get_local_outgoing_weight_avg(node) + 
+                       node_get_local_incoming_weight_avg(node)) / 2.0f;
+    float rate = (local_avg > 0.0f) ? node->weight / (node->weight + local_avg) : 0.1f;
+    
+    /* Weight updates relative to activation state */
+    node->weight = node->weight * (1.0f - rate) + (node->activation ? 1.0f : 0.0f) * rate;
 }
 
 /* Get local average weight from outgoing edges (local measurement) */
@@ -152,19 +105,17 @@ float node_get_local_incoming_weight_avg(Node *node) {
     return sum / (float)node->incoming_count;
 }
 
-/* Free node and its payload */
+/* Free node (payload is stored inline, so freeing node frees payload too) */
 void node_free(Node *node) {
     if (!node) return;
     
-    if (node->payload) {
-        free(node->payload);
-    }
     if (node->outgoing_edges) {
         free(node->outgoing_edges);
     }
     if (node->incoming_edges) {
         free(node->incoming_edges);
     }
+    /* Payload is stored inline (flexible array member), so freeing node frees payload */
     free(node);
 }
 
@@ -172,18 +123,16 @@ void node_free(Node *node) {
  * EDGE OPERATIONS (Local Only)
  * ======================================== */
 
-/* Create a new edge between two nodes */
+/* Create a new edge between two nodes (direct node pointers - no searching) */
 Edge* edge_create(Node *from, Node *to, bool direction) {
     if (!from || !to) return NULL;
     
     Edge *edge = (Edge*)calloc(1, sizeof(Edge));
     if (!edge) return NULL;
     
-    strncpy(edge->from_id, from->id, 8);
-    edge->from_id[8] = '\0';
-    strncpy(edge->to_id, to->id, 8);
-    edge->to_id[8] = '\0';
-    
+    /* Store node pointers directly (no IDs needed - IDs in nodes) */
+    edge->from_node = from;
+    edge->to_node = to;
     edge->direction = direction;
     edge->activation = false;
     edge->weight = 0.0f;
@@ -191,17 +140,15 @@ Edge* edge_create(Node *from, Node *to, bool direction) {
     return edge;
 }
 
-/* Update edge weight based on local activation history */
+/* Update edge weight based on local activation history (relative to edge's current state) */
 void edge_update_weight_local(Edge *edge) {
     if (!edge) return;
     
-    /* Local measurement: weight is activation history */
-    float alpha = 0.1f;  /* Learning rate (could be made relative later) */
-    if (edge->activation) {
-        edge->weight = edge->weight * (1.0f - alpha) + 1.0f * alpha;
-    } else {
-        edge->weight = edge->weight * (1.0f - alpha) + 0.0f * alpha;
-    }
+    /* Learning rate relative to edge's current weight (self-relative) */
+    float rate = edge->weight / (edge->weight + 1.0f);
+    
+    /* Weight updates relative to activation state */
+    edge->weight = edge->weight * (1.0f - rate) + (edge->activation ? 1.0f : 0.0f) * rate;
 }
 
 /* Free edge */
@@ -212,39 +159,43 @@ void edge_free(Edge *edge) {
 }
 
 /* ========================================
- * GRAPH OPERATIONS
+ * BOOTSTRAP: .M FILE CREATION
  * ======================================== */
 
-/* Create a new graph */
+/* Bootstrap: Create a new .m file (primary entry point) */
+MelvinMFile* melvin_bootstrap(const char *filename) {
+    /* Create .m file - this is the bootstrap */
+    return melvin_m_create(filename);
+}
+
+/* ========================================
+ * GRAPH OPERATIONS (Internal - used by .m file operations)
+ * ======================================== */
+
+/* Create a new graph (internal use - for .m file operations) */
 MelvinGraph* graph_create(void) {
     MelvinGraph *g = (MelvinGraph*)calloc(1, sizeof(MelvinGraph));
     if (!g) return NULL;
     
-    g->node_capacity = 16;
-    g->nodes = (Node**)calloc(g->node_capacity, sizeof(Node*));
+    /* No capacity limits - start with 0, allocate dynamically on first add */
+    g->node_capacity = 0;
+    g->nodes = NULL;
     g->node_count = 0;
     
-    g->edge_capacity = 32;
-    g->edges = (Edge**)calloc(g->edge_capacity, sizeof(Edge*));
+    g->edge_capacity = 0;
+    g->edges = NULL;
     g->edge_count = 0;
     
     return g;
 }
 
-/* Add node to graph */
+/* Add node to graph (creation law - nodes created through wave propagation) */
 bool graph_add_node(MelvinGraph *g, Node *node) {
     if (!g || !node) return false;
     
-    /* Check if node already exists */
-    for (size_t i = 0; i < g->node_count; i++) {
-        if (g->nodes[i] && strcmp(g->nodes[i]->id, node->id) == 0) {
-            return false;  /* Node already exists */
-        }
-    }
-    
-    /* Resize if needed */
+    /* Resize if needed (no capacity limits - allocate dynamically) */
     if (g->node_count >= g->node_capacity) {
-        size_t new_capacity = g->node_capacity * 2;
+        size_t new_capacity = (g->node_capacity == 0) ? 1 : g->node_capacity * 2;
         Node **new_nodes = (Node**)realloc(g->nodes, new_capacity * sizeof(Node*));
         if (!new_nodes) return false;
         g->nodes = new_nodes;
@@ -255,25 +206,13 @@ bool graph_add_node(MelvinGraph *g, Node *node) {
     return true;
 }
 
-/* Find node by ID */
-Node* graph_find_node(MelvinGraph *g, const char *id) {
-    if (!g || !id) return NULL;
+/* Add edge to graph and connect to nodes (creation law - nodes created through wave prop) */
+bool graph_add_edge(MelvinGraph *g, Edge *edge, Node *from, Node *to) {
+    if (!g || !edge || !from || !to) return false;
     
-    for (size_t i = 0; i < g->node_count; i++) {
-        if (g->nodes[i] && strcmp(g->nodes[i]->id, id) == 0) {
-            return g->nodes[i];
-        }
-    }
-    return NULL;
-}
-
-/* Add edge to graph and connect to nodes */
-bool graph_add_edge(MelvinGraph *g, Edge *edge) {
-    if (!g || !edge) return false;
-    
-    /* Resize if needed */
+    /* Resize if needed (no capacity limits - allocate dynamically) */
     if (g->edge_count >= g->edge_capacity) {
-        size_t new_capacity = g->edge_capacity * 2;
+        size_t new_capacity = (g->edge_capacity == 0) ? 1 : g->edge_capacity * 2;
         Edge **new_edges = (Edge**)realloc(g->edges, new_capacity * sizeof(Edge*));
         if (!new_edges) return false;
         g->edges = new_edges;
@@ -282,33 +221,26 @@ bool graph_add_edge(MelvinGraph *g, Edge *edge) {
     
     g->edges[g->edge_count++] = edge;
     
-    /* Connect edge to nodes (local to nodes) */
-    Node *from = graph_find_node(g, edge->from_id);
-    Node *to = graph_find_node(g, edge->to_id);
-    
-    if (from) {
+    /* Connect edge to nodes (local to nodes) - no searching, direct connection */
         /* Add to from node's outgoing edges */
         if (from->outgoing_count >= from->outgoing_capacity) {
-            size_t new_cap = from->outgoing_capacity * 2;
+        size_t new_cap = (from->outgoing_capacity == 0) ? 1 : from->outgoing_capacity * 2;
             Edge **new_out = (Edge**)realloc(from->outgoing_edges, new_cap * sizeof(Edge*));
             if (!new_out) return false;
             from->outgoing_edges = new_out;
             from->outgoing_capacity = new_cap;
         }
         from->outgoing_edges[from->outgoing_count++] = edge;
-    }
     
-    if (to) {
         /* Add to to node's incoming edges */
         if (to->incoming_count >= to->incoming_capacity) {
-            size_t new_cap = to->incoming_capacity * 2;
+        size_t new_cap = (to->incoming_capacity == 0) ? 1 : to->incoming_capacity * 2;
             Edge **new_in = (Edge**)realloc(to->incoming_edges, new_cap * sizeof(Edge*));
             if (!new_in) return false;
             to->incoming_edges = new_in;
             to->incoming_capacity = new_cap;
         }
         to->incoming_edges[to->incoming_count++] = edge;
-    }
     
     return true;
 }
@@ -336,102 +268,104 @@ void graph_free(MelvinGraph *g) {
  * WAVE PROPAGATION (Local Operations Only)
  * ======================================== */
 
-/* Propagate activation from a node through its outgoing edges (local) */
+/* Propagate activation from a node through its outgoing edges (local, relative) */
+/* Node acts as mini neural net - "thinks" by combining edge weights + payload structure */
+/* Wave prop "selects" nodes by activating edges based on relative influence */
 void wave_propagate_from_node(Node *node) {
     if (!node || !node->activation) return;
     
-    /* Node only knows its own edges (local) */
+    /* Local average serves multiple jobs: normalization + decision basis + neural net input */
+    float local_avg = node_get_local_outgoing_weight_avg(node);
+    
     for (size_t i = 0; i < node->outgoing_count; i++) {
         Edge *edge = node->outgoing_edges[i];
         if (!edge) continue;
         
-        /* Local measurement: edge weight relative to local average */
-        float local_avg = node_get_local_outgoing_weight_avg(node);
-        float relative_weight = (local_avg > 0.0f) ? edge->weight / local_avg : 0.0f;
+        /* Node "thinks" by computing relative influence (edge weight + payload structure) */
+        /* Edge weight relative to local average (relative measurement) */
+        float influence = (local_avg > 0.0f) ? edge->weight / local_avg : edge->weight;
         
-        /* Activate edge if relative weight is significant (local decision) */
-        if (relative_weight > 0.5f || edge->weight > 0.0f) {
+        /* Payload bytes naturally influence (relative to payload structure) - mini neural net */
+        /* Payload acts as node's "brain" - influences which edges to activate */
+        if (node->payload_size > 0) {
+            float payload_val = (float)node->payload[i % node->payload_size];
+            float payload_max = (node->payload_size > 0) ? 255.0f : 1.0f;
+            /* Combine relative to each other (no hardcoded weights) */
+            influence = (influence + payload_val / payload_max) / 2.0f;
+        }
+        
+        /* Wave prop "selects" edge if influence > 0 (relative decision, no absolute threshold) */
+        if (influence > 0.0f) {
             edge->activation = true;
             edge_update_weight_local(edge);
             
-            /* Find target node and activate it (would need graph reference, but keeping local) */
-            /* In full implementation, this would be handled differently */
+            /* Activate target node directly (no searching - edge has node pointer) */
+            if (edge->to_node) {
+                edge->to_node->activation = true;
+                /* Recursively propagate from target node (wave continues) */
+                wave_propagate_from_node(edge->to_node);
+            }
         }
     }
     
-    /* Update node weight locally */
     node_update_weight_local(node);
 }
 
 /* ========================================
- * MAIN / TESTING
+ * PAYLOAD EXPANSION & HIERARCHY (Relative Operations)
  * ======================================== */
 
-int main(void) {
-    printf("Melvin: Emergent Intelligence System\n");
-    printf("=====================================\n\n");
+/* Combine nodes into larger payload when patterns repeat (hierarchy formation) */
+/* Payload expands by combining - all relative, no hardcoded rules */
+Node* node_combine_payloads(Node *node1, Node *node2) {
+    if (!node1 || !node2) return NULL;
     
-    /* Create graph */
-    MelvinGraph *g = graph_create();
-    if (!g) {
-        fprintf(stderr, "Failed to create graph\n");
-        return 1;
+    /* Combined size relative to both nodes */
+    size_t combined_size = node1->payload_size + node2->payload_size;
+    
+    /* Allocate combined payload */
+    uint8_t *combined = (uint8_t*)malloc(combined_size);
+    if (!combined) return NULL;
+    
+    /* Combine payloads (relative combination) */
+    memcpy(combined, node1->payload, node1->payload_size);
+    memcpy(combined + node1->payload_size, node2->payload, node2->payload_size);
+    
+    /* Create new node with combined payload (hierarchy) */
+    Node *combined_node = node_create(combined, combined_size);
+    free(combined);
+    
+    /* Weight relative to both nodes */
+    if (combined_node) {
+        combined_node->weight = (node1->weight + node2->weight) / 2.0f;
     }
     
-    /* Create some test nodes with different payload sizes */
-    uint8_t small_payload = 0x42;
-    Node *node1 = node_create(&small_payload, 1);
-    
-    uint8_t medium_payload[] = {0x48, 0x65, 0x6C, 0x6C, 0x6F};  /* "Hello" */
-    Node *node2 = node_create(medium_payload, 5);
-    
-    uint8_t large_payload[100];
-    for (int i = 0; i < 100; i++) {
-        large_payload[i] = (uint8_t)(i % 256);
-    }
-    Node *node3 = node_create(large_payload, 100);
-    
-    /* Add nodes to graph */
-    graph_add_node(g, node1);
-    graph_add_node(g, node2);
-    graph_add_node(g, node3);
-    
-    printf("Created %zu nodes:\n", g->node_count);
-    printf("  Node %s: payload_size=%zu, activation=%d, weight=%.3f\n",
-           node1->id, node1->payload_size, node1->activation, node1->weight);
-    printf("  Node %s: payload_size=%zu, activation=%d, weight=%.3f\n",
-           node2->id, node2->payload_size, node2->activation, node2->weight);
-    printf("  Node %s: payload_size=%zu, activation=%d, weight=%.3f\n",
-           node3->id, node3->payload_size, node3->activation, node3->weight);
-    
-    /* Create edges */
-    Edge *edge1 = edge_create(node1, node2, true);
-    Edge *edge2 = edge_create(node2, node3, true);
-    
-    graph_add_edge(g, edge1);
-    graph_add_edge(g, edge2);
-    
-    printf("\nCreated %zu edges:\n", g->edge_count);
-    printf("  Edge: %s -> %s, direction=%d, weight=%.3f\n",
-           edge1->from_id, edge1->to_id, edge1->direction, edge1->weight);
-    printf("  Edge: %s -> %s, direction=%d, weight=%.3f\n",
-           edge2->from_id, edge2->to_id, edge2->direction, edge2->weight);
-    
-    /* Test local measurements */
-    printf("\nLocal measurements (node %s):\n", node1->id);
-    printf("  Outgoing weight avg: %.3f\n", node_get_local_outgoing_weight_avg(node1));
-    printf("  Incoming weight avg: %.3f\n", node_get_local_incoming_weight_avg(node1));
-    
-    /* Test activation */
-    node1->activation = true;
-    node_update_weight_local(node1);
-    printf("\nAfter activating node %s:\n", node1->id);
-    printf("  Weight: %.3f\n", node1->weight);
-    
-    /* Cleanup */
-    graph_free(g);
-    
-    printf("\nSystem test complete.\n");
-    return 0;
+    return combined_node;
 }
+
+/* Create blank/template node (for pattern matching and generalization) */
+/* Blank nodes have empty payload - can be filled when patterns match */
+Node* node_create_blank(void) {
+    return node_create(NULL, 0);
+}
+
+/* Fill blank node with payload when pattern matches (relative to match strength) */
+/* Returns new node with filled payload, original blank_node unchanged */
+Node* node_fill_blank(Node *blank_node, const uint8_t *pattern, size_t pattern_size, float match_strength) {
+    if (!blank_node || !pattern || pattern_size == 0 || match_strength <= 0.0f) return NULL;
+    
+    /* Fill size relative to match strength */
+    size_t fill_size = (size_t)(pattern_size * match_strength);
+    if (fill_size == 0) fill_size = 1;
+    
+    /* Create new node with filled payload (relative to match strength) */
+    Node *filled_node = node_create(pattern, fill_size);
+    if (!filled_node) return NULL;
+    
+    /* Weight relative to match strength and original blank weight */
+    filled_node->weight = (blank_node->weight + match_strength) / 2.0f;
+    
+    return filled_node;
+}
+
 
