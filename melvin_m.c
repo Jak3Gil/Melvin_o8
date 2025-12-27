@@ -9,6 +9,7 @@
 #include <string.h>
 #include <time.h>
 #include <errno.h>
+#include <stdlib.h>
 
 /* ========================================
  * INTERNAL HELPER FUNCTIONS
@@ -57,16 +58,17 @@ static bool write_nodes(FILE *file, MelvinGraph *graph, uint64_t offset) {
         /* Write node ID */
         if (fwrite(node->id, 9, 1, file) != 1) return false;
         
-        /* Write activation and weight */
-        if (fwrite(&node->activation, sizeof(bool), 1, file) != 1) return false;
+        /* Write activation_strength, weight, and bias (replacing bool activation) */
+        if (fwrite(&node->activation_strength, sizeof(float), 1, file) != 1) return false;
         if (fwrite(&node->weight, sizeof(float), 1, file) != 1) return false;
+        if (fwrite(&node->bias, sizeof(float), 1, file) != 1) return false;
         
         /* Write payload size */
         uint64_t payload_size = node->payload_size;
         if (fwrite(&payload_size, sizeof(uint64_t), 1, file) != 1) return false;
         
         /* Write payload data if exists */
-        if (node->payload && payload_size > 0) {
+        if (payload_size > 0) {
             if (fwrite(node->payload, 1, payload_size, file) != payload_size) return false;
         }
         
@@ -89,16 +91,18 @@ static bool read_nodes(FILE *file, MelvinGraph *graph, uint64_t offset) {
     /* Read each node */
     for (uint64_t i = 0; i < node_count; i++) {
         char id[9];
-        bool activation;
+        float activation_strength;
         float weight;
+        float bias;
         uint64_t payload_size;
         
         /* Read node ID */
         if (fread(id, 9, 1, file) != 1) return false;
         
-        /* Read activation and weight */
-        if (fread(&activation, sizeof(bool), 1, file) != 1) return false;
+        /* Read activation_strength, weight, and bias */
+        if (fread(&activation_strength, sizeof(float), 1, file) != 1) return false;
         if (fread(&weight, sizeof(float), 1, file) != 1) return false;
+        if (fread(&bias, sizeof(float), 1, file) != 1) return false;
         
         /* Read payload size */
         if (fread(&payload_size, sizeof(uint64_t), 1, file) != 1) return false;
@@ -126,8 +130,9 @@ static bool read_nodes(FILE *file, MelvinGraph *graph, uint64_t offset) {
         node->id[8] = '\0';
         
         /* Set state */
-        node->activation = activation;
+        node->activation_strength = activation_strength;
         node->weight = weight;
+        node->bias = bias;
         
         /* Add to graph */
         if (!graph_add_node(graph, node)) {
@@ -157,9 +162,9 @@ static bool write_edges(FILE *file, MelvinGraph *graph, uint64_t offset) {
         Edge *edge = graph->edges[i];
         if (!edge) continue;
         
-        /* Write edge data */
-        if (fwrite(edge->from_id, 9, 1, file) != 1) return false;
-        if (fwrite(edge->to_id, 9, 1, file) != 1) return false;
+        /* Write edge data (store node IDs from node pointers) */
+        if (fwrite(edge->from_node->id, 9, 1, file) != 1) return false;
+        if (fwrite(edge->to_node->id, 9, 1, file) != 1) return false;
         if (fwrite(&edge->direction, sizeof(bool), 1, file) != 1) return false;
         if (fwrite(&edge->activation, sizeof(bool), 1, file) != 1) return false;
         if (fwrite(&edge->weight, sizeof(float), 1, file) != 1) return false;
@@ -191,9 +196,16 @@ static bool read_edges(FILE *file, MelvinGraph *graph, uint64_t offset) {
         if (fread(&activation, sizeof(bool), 1, file) != 1) return false;
         if (fread(&weight, sizeof(float), 1, file) != 1) return false;
         
-        /* Find nodes */
-        Node *from = graph_find_node(graph, from_id);
-        Node *to = graph_find_node(graph, to_id);
+        /* Find nodes by ID (temporary helper for file loading only) */
+        Node *from = NULL, *to = NULL;
+        for (size_t j = 0; j < graph->node_count; j++) {
+            if (graph->nodes[j] && strcmp(graph->nodes[j]->id, from_id) == 0) {
+                from = graph->nodes[j];
+            }
+            if (graph->nodes[j] && strcmp(graph->nodes[j]->id, to_id) == 0) {
+                to = graph->nodes[j];
+            }
+        }
         
         if (!from || !to) continue; /* Skip invalid edges */
         
@@ -206,7 +218,7 @@ static bool read_edges(FILE *file, MelvinGraph *graph, uint64_t offset) {
         edge->weight = weight;
         
         /* Add to graph */
-        graph_add_edge(graph, edge);
+        graph_add_edge(graph, edge, from, to);
     }
     
     return true;
@@ -402,6 +414,7 @@ MelvinMFile* melvin_m_create(const char *filename) {
     }
     
     mfile->is_dirty = true;
+    mfile->last_input_port_id = 0;  /* Initialize port ID tracking */
     
     return mfile;
 }
@@ -485,6 +498,7 @@ MelvinMFile* melvin_m_open(const char *filename) {
         return NULL;
     }
     mfile->universal_output_capacity = output_size > 1024 ? output_size : 1024;
+    mfile->last_input_port_id = 0;  /* Initialize port ID tracking */
     
     mfile->is_dirty = false;
     
@@ -675,7 +689,7 @@ Edge* melvin_m_add_edge(MelvinMFile *mfile, Node *from, Node *to, bool direction
     Edge *edge = edge_create(from, to, direction);
     if (!edge) return NULL;
     
-    if (graph_add_edge(mfile->graph, edge)) {
+    if (graph_add_edge(mfile->graph, edge, from, to)) {
         melvin_m_mark_dirty(mfile);
         return edge;
     }
@@ -690,58 +704,81 @@ bool melvin_m_process_input(MelvinMFile *mfile) {
     /* Clear universal output */
     melvin_m_universal_output_clear(mfile);
     
-    /* Process universal input through graph via wave propagation */
-    /* Feed input into graph: activate nodes based on input data */
+    /* Extract input port ID from input buffer (CAN bus format: first byte is port_id) */
+    /* This is ephemeral context for routing output to correct port */
+    /* Port ID stays in payload for pattern learning (unified graph), but we track it */
+    /* separately for I/O routing purposes */
+    mfile->last_input_port_id = 0;  /* Default: no port ID */
     if (mfile->universal_input && mfile->header.universal_input_size > 0) {
-        /* For each node, check if input matches/activates it */
-        for (size_t i = 0; i < mfile->graph->node_count; i++) {
-            Node *node = mfile->graph->nodes[i];
-            if (!node) continue;
-            
-            /* Simple activation: if node payload matches input pattern */
-            /* In a full implementation, this would be more sophisticated */
-            if (node->payload && node->payload_size > 0) {
-                /* Activate node if payload matches input (simplified) */
-                if (node->payload_size <= mfile->header.universal_input_size) {
-                    if (memcmp(node->payload, mfile->universal_input, node->payload_size) == 0) {
-                        node->activation = true;
-                    }
-                }
-            }
-        }
+        mfile->last_input_port_id = mfile->universal_input[0];  /* First byte = port_id */
     }
     
-    /* Run wave propagation from all activated nodes */
-    for (size_t i = 0; i < mfile->graph->node_count; i++) {
-        Node *node = mfile->graph->nodes[i];
-        if (node && node->activation) {
-            wave_propagate_from_node(node);
-        }
-    }
+    /* DON'T reset activations immediately - let wave propagation use them as seeds */
+    /* Activations will be used for wave exploration to find existing nodes */
+    /* They'll get reset naturally as new processing activates different nodes */
     
-    /* Collect output: gather activated nodes' payloads into universal_output */
-    size_t output_offset = 0;
-    for (size_t i = 0; i < mfile->graph->node_count; i++) {
-        Node *node = mfile->graph->nodes[i];
-        if (!node || !node->activation) continue;
+    /* Track initially activated nodes (those matching input) */
+    Node **initial_nodes = NULL;
+    size_t initial_count = 0;
+    
+    /* STEP 1: Process input data to find sequential patterns and activate/create nodes */
+    /* This creates nodes for sequential parts of the data (e.g., "CAT" -> nodes for C, A, T) */
+    Node **seq_nodes = NULL;
+    size_t seq_count = 0;
+    if (mfile->universal_input && mfile->header.universal_input_size > 0) {
+        seq_nodes = wave_process_sequential_patterns(mfile->graph, 
+            mfile->universal_input, mfile->header.universal_input_size, &seq_count);
         
-        if (node->payload && node->payload_size > 0) {
-            /* Resize output buffer if needed */
-            if (output_offset + node->payload_size > mfile->universal_output_capacity) {
-                size_t new_capacity = (output_offset + node->payload_size) * 2;
-                uint8_t *new_output = (uint8_t*)realloc(mfile->universal_output, new_capacity);
-                if (!new_output) break;
-                mfile->universal_output = new_output;
-                mfile->universal_output_capacity = new_capacity;
-            }
-            
-            /* Copy node payload to output */
-            memcpy(mfile->universal_output + output_offset, node->payload, node->payload_size);
-            output_offset += node->payload_size;
+        if (seq_nodes && seq_count > 0) {
+            /* Use sequential nodes as initial nodes */
+            initial_nodes = seq_nodes;
+            initial_count = seq_count;
         }
     }
     
-    mfile->header.universal_output_size = output_offset;
+    /* STEP 2: Create edges from all mechanisms (intelligent edge formation) */
+    /* Co-activation, similarity, context, hierarchy, and homeostatic edges */
+    /* Multiple mechanisms create rich graph structure for semantic understanding */
+    if (initial_nodes && initial_count > 0) {
+        wave_form_intelligent_edges(mfile->graph, initial_nodes, initial_count, NULL, NULL);
+    }
+    
+    /* STEP 3: Multi-step wave propagation (unified - all abstraction levels) */
+    /* Now wave can propagate along the edges we just created */
+    if (initial_nodes && initial_count > 0) {
+        wave_propagate_multi_step(mfile->graph, initial_nodes, initial_count);
+    }
+    
+    /* STEP 4: Hierarchy formation emerges naturally from edge weight growth during co-activation */
+    /* No explicit check needed - hierarchy forms implicitly when patterns repeat and edges strengthen */
+    /* See wave_create_edges_from_coactivation() for natural hierarchy emergence */
+    
+    /* STEP 5: Output collection from direct input nodes and sequential continuations only */
+    /* KEY: Activation (exploration) != Output (intent) */
+    /* Wave propagation activates nodes for context/exploration, but output should only */
+    /* come from direct input nodes and learned sequential patterns (co-activation edges) */
+    uint8_t *output = NULL;
+    size_t output_size = 0;
+    wave_collect_output(mfile->graph, initial_nodes, initial_count, &output, &output_size);
+    
+    if (output && output_size > 0) {
+        if (output_size > mfile->universal_output_capacity) {
+            mfile->universal_output_capacity = output_size * 2;
+            mfile->universal_output = (uint8_t*)realloc(mfile->universal_output, mfile->universal_output_capacity);
+            if (!mfile->universal_output) {
+                free(output);
+                if (seq_nodes) free(seq_nodes);
+                return false;
+            }
+        }
+        memcpy(mfile->universal_output, output, output_size);
+        mfile->header.universal_output_size = output_size;
+        free(output);
+    } else {
+        mfile->header.universal_output_size = 0;
+    }
+    
+    if (seq_nodes) free(seq_nodes);
     melvin_m_mark_dirty(mfile);
     
     return true;
@@ -762,5 +799,17 @@ bool melvin_m_is_dirty(MelvinMFile *mfile) {
 uint64_t melvin_m_get_adaptation_count(MelvinMFile *mfile) {
     if (!mfile) return 0;
     return mfile->header.adaptation_count;
+}
+
+/* ========================================
+ * PORT ROUTING OPERATIONS
+ * ======================================== */
+
+/* Get last input port ID from the most recent process_input call (for output routing) */
+/* Port ID is extracted from input buffer (CAN bus format: first byte is port_id) */
+/* This is ephemeral context - used to route output to correct port based on input port */
+uint8_t melvin_m_get_last_input_port_id(MelvinMFile *mfile) {
+    if (!mfile) return 0;
+    return mfile->last_input_port_id;
 }
 

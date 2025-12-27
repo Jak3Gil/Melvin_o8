@@ -1,26 +1,31 @@
 # Build artifacts
-*.exe
 *.o
-*.obj
+*.dSYM
 *.a
-*.lib
-*.dll
 *.so
+*.dylib
 
-# Debug files
-*.dSYM/
-*.su
-*.idb
-*.pdb
+# Test executables
+test/test_*
+test/analyze_*
+test/debug_*
+test/example_*
+test/verify_*
 
-# IDE files
+# Test output files
+*.m
+test/*.m
+test/*.log
+test/*.txt
+test/output.txt
+
+# IDE/Editor files
 .vscode/
 .idea/
 *.swp
 *.swo
 *~
 
-# OS files
-.DS_Store
-Thumbs.db
-
+# Debug logs
+.cursor/
+*.log

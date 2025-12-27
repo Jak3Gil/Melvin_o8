@@ -18,53 +18,15 @@
 #include "melvin.h"
 
 /* ========================================
- * .M FILE FORMAT STRUCTURE
+ * .M FILE FORMAT CONSTANTS
  * ======================================== */
 
 /* Magic number for .m files: "MELVIN\0\0" */
 #define MELVIN_M_MAGIC 0x4D454C56494E0000ULL  /* "MELVIN\0\0" in ASCII */
 #define MELVIN_M_VERSION 1
 
-/* .m File Header */
-typedef struct MelvinMHeader {
-    uint64_t magic;         /* Magic number: MELVIN_M_MAGIC */
-    uint32_t version;       /* File format version */
-    uint32_t flags;         /* Format flags */
-    
-    /* Graph structure */
-    uint64_t node_count;    /* Number of nodes */
-    uint64_t edge_count;    /* Number of edges */
-    
-    /* Universal input buffer (any binary input) */
-    uint64_t universal_input_size;  /* Size of universal input buffer */
-    uint64_t universal_input_offset; /* Offset to universal input data */
-    
-    /* Universal output buffer (wave propagation output) */
-    uint64_t universal_output_size;  /* Size of universal output buffer */
-    uint64_t universal_output_offset; /* Offset to universal output data */
-    
-    /* Data offsets */
-    uint64_t nodes_offset;  /* Offset to node data section */
-    uint64_t edges_offset;  /* Offset to edge data section */
-    uint64_t payloads_offset; /* Offset to payload data section */
-    
-    /* Adaptive metadata */
-    uint64_t last_modified; /* Timestamp of last modification */
-    uint64_t adaptation_count; /* Number of adaptations */
-} MelvinMHeader;
-
-/* .m File Context */
-typedef struct MelvinMFile {
-    FILE *file;
-    char *filename;
-    MelvinMHeader header;
-    MelvinGraph *graph;     /* In-memory graph (uses melvin.c rules) */
-    uint8_t *universal_input; /* Universal input buffer (any binary input) */
-    size_t universal_input_capacity;
-    uint8_t *universal_output; /* Universal output buffer (wave propagation output) */
-    size_t universal_output_capacity;
-    bool is_dirty;           /* True if file needs to be saved */
-} MelvinMFile;
+/* Note: MelvinMHeader and MelvinMFile structures are defined in melvin.h */
+/* This header provides the .m file operations API */
 
 /* ========================================
  * .M FILE OPERATIONS
@@ -139,6 +101,14 @@ bool melvin_m_is_dirty(MelvinMFile *mfile);
 
 /* Get adaptation count */
 uint64_t melvin_m_get_adaptation_count(MelvinMFile *mfile);
+
+/* ========================================
+ * PORT ROUTING OPERATIONS
+ * ======================================== */
+
+/* Get last input port ID from the most recent process_input call (for output routing) */
+/* Port ID is extracted from input buffer (CAN bus format: first byte is port_id) */
+uint8_t melvin_m_get_last_input_port_id(MelvinMFile *mfile);
 
 #endif /* MELVIN_M_H */
 
