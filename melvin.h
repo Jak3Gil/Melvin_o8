@@ -80,6 +80,12 @@ typedef struct MelvinGraph {
     Edge **edges;
     size_t edge_count;
     size_t edge_capacity;
+    
+    /* Context: Last activated nodes (seeds for next input) */
+    /* Memory = weights, Context = activation */
+    Node **last_activated;
+    size_t last_activated_count;
+    size_t last_activated_capacity;
 } MelvinGraph;
 
 /* ========================================

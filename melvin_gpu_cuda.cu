@@ -147,8 +147,6 @@ __global__ void cuda_batch_update_weights_kernel(
 /* Wrapper functions that interface with the CPU code */
 
 /* Initialize CUDA and detect GPU */
-/* Note: This function is weakly linked - if CUDA object isn't linked, CPU fallback is used */
-extern "C" bool melvin_gpu_cuda_init(MelvinGPUContext *ctx) __attribute__((weak));
 extern "C" bool melvin_gpu_cuda_init(MelvinGPUContext *ctx) {
     if (!ctx) return false;
     

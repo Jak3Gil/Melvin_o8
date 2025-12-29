@@ -23,17 +23,6 @@
 #include <float.h>
 #include <string.h>
 
-// #region agent log
-/* Debug logging helper - writes NDJSON to debug log file */
-static void debug_log(const char *location, const char *message, const char *data_json) {
-    FILE *log_file = fopen("/Users/jakegilbert/Desktop/Melvin_Reasearch/Melvin_o8/.cursor/debug.log", "a");
-    if (log_file) {
-        fprintf(log_file, "{\"location\":\"%s\",\"message\":\"%s\",\"data\":%s,\"timestamp\":%ld,\"sessionId\":\"debug-session\",\"runId\":\"adaptive-fix\"}\n",
-                location, message, data_json ? data_json : "{}", (long)time(NULL));
-        fclose(log_file);
-    }
-}
-// #endregion agent log
 
 /* ========================================
  * UTILITY FUNCTIONS
@@ -59,21 +48,19 @@ static int compare_float(const void *a, const void *b) {
 static size_t calculate_optimal_hash_size(size_t graph_node_count) {
     /* DATA-DRIVEN: Hash size = graph_size * load_factor (50% fill for good performance) */
     /* No hardcoded thresholds - adapts to any graph size */
+    /* RELATIVE: Use minimal context - start with size 1, grows immediately like nature */
+    /* When no data exists, use absolute minimum (1) and let it grow from data */
     if (graph_node_count == 0) {
-        // #region agent log
-        char log_data[128];
-        snprintf(log_data, sizeof(log_data), "{\"hypothesisId\":\"C\",\"return_value\":256,\"reason\":\"empty_graph_minimum\"}");
-        debug_log("melvin.c:62", "Minimum hash size for empty graph", log_data);
-        // #endregion agent log
-        return 256;  /* Minimum for empty graph */
+        return 1;  /* Minimal context: absolute minimum, grows immediately when data arrives */
     }
     
     /* Compute optimal size: 2x graph size gives ~50% load factor */
     size_t optimal = graph_node_count * 2;
     
     /* Round up to next power of 2 for efficient modulo operation */
+    /* RELATIVE: Start from minimal power of 2 (1), grows to optimal */
     /* No maximum - scales with graph size */
-    size_t power_of_2 = 256;  /* Start from minimum */
+    size_t power_of_2 = 1;  /* Start from absolute minimum, like nature */
     while (power_of_2 < optimal && power_of_2 < SIZE_MAX / 2) {
         power_of_2 <<= 1;  /* Double until >= optimal */
     }
@@ -97,8 +84,11 @@ static size_t node_ptr_hash(VisitedSet *set, Node *node) {
 }
 
 static VisitedSet* visited_set_create(size_t hash_size) {
-    /* DATA-DRIVEN: Only enforce minimum for empty graphs, no maximum */
-    if (hash_size < 256) hash_size = 256;  /* Minimum for functionality */
+    /* RELATIVE: Use minimal context - ensure at least 1, grows immediately */
+    /* Like nature: start from absolute minimum, grow from data */
+    if (hash_size < 1) {
+        hash_size = 1;  /* Absolute minimum, grows immediately when data arrives */
+    }
     /* No maximum - let it scale with graph size */
     
     VisitedSet *set = (VisitedSet*)calloc(1, sizeof(VisitedSet));
@@ -169,7 +159,8 @@ static bool visited_set_add(VisitedSet *set, Node *node) {
     
     /* Allocate bucket if needed */
     if (!bucket) {
-        *bucket_capacity = 4;
+        /* RELATIVE: Use minimal context - start with 1, grows immediately like nature */
+        *bucket_capacity = 1;  /* Absolute minimum, grows immediately when data arrives */
         bucket = (Node**)calloc(*bucket_capacity, sizeof(Node*));
         if (!bucket) return false;
         set->buckets[bucket_idx] = bucket;
@@ -193,308 +184,17 @@ static bool visited_set_add(VisitedSet *set, Node *node) {
 }
 
 /* ========================================
- * ADAPTIVE STATISTICS SYSTEM (Data-Driven Thresholds)
+ * LOCAL VALUE COMPUTATIONS (No Global Statistics)
  * ======================================== */
 
-/* Adaptive histogram for percentiles (O(1) update, O(1) query) */
-/* DATA-DRIVEN: No fixed bucket count - adapts to data volume */
-
+/* Empty struct for backward compatibility - no longer used */
 typedef struct WaveStatistics {
-    /* Adaptive histogram: finds min/max of values, then buckets that range */
-    float value_min;  /* Minimum value seen in current wave */
-    float value_max;  /* Maximum value seen in current wave */
-    int *histogram;  /* Dynamic buckets - allocated based on data count */
-    int histogram_bucket_count;  /* Current number of buckets (adaptive) */
-    int histogram_count;  /* Total values added to histogram */
-    
-    /* Cached percentiles (computed once per wave) */
-    float p25;  /* 25th percentile */
-    float p50;  /* 50th percentile (median) */
-    float p75;  /* 75th percentile */
-    float p90;  /* 90th percentile */
-    float p95;  /* 95th percentile */
-    
-    /* Acceptance strength statistics (for blank node filling) */
-    float acceptance_min;
-    float acceptance_max;
-    int *acceptance_histogram;  /* Dynamic buckets */
-    int acceptance_bucket_count;  /* Adaptive bucket count */
-    int acceptance_count;
-    float acceptance_p90;  /* 90th percentile for acceptance threshold */
-    
-    /* Similarity statistics (for similarity edge detection) */
-    float similarity_min;
-    float similarity_max;
-    int *similarity_histogram;  /* Dynamic buckets */
-    int similarity_bucket_count;  /* Adaptive bucket count */
-    int similarity_count;
-    float similarity_p75;  /* 75th percentile for similarity threshold */
-    
-    /* Edge weight statistics (for similarity edge range) */
-    float edge_weight_min;
-    float edge_weight_max;
-    int *edge_weight_histogram;  /* Dynamic buckets */
-    int edge_weight_bucket_count;  /* Adaptive bucket count */
-    int edge_weight_count;
-    float edge_weight_p25;  /* 25th percentile for lower bound */
-    float edge_weight_p75;  /* 75th percentile for upper bound */
+    /* No longer needed - all decisions use local values from nodes/edges */
 } WaveStatistics;
-
-/* Initialize wave statistics */
-static void wave_statistics_init(WaveStatistics *stats) {
-    if (!stats) return;
-    memset(stats, 0, sizeof(WaveStatistics));
-    stats->value_min = FLT_MAX;
-    stats->value_max = FLT_MIN;
-    stats->acceptance_min = FLT_MAX;
-    stats->acceptance_max = FLT_MIN;
-    stats->similarity_min = FLT_MAX;
-    stats->similarity_max = FLT_MIN;
-    stats->edge_weight_min = FLT_MAX;
-    stats->edge_weight_max = FLT_MIN;
-    
-    /* DATA-DRIVEN: Initialize with adaptive bucket counts based on expected data */
-    /* Start with reasonable default, will grow as needed */
-    // #region agent log
-    char log_data[128];
-    snprintf(log_data, sizeof(log_data), "{\"hypothesisId\":\"C\",\"initial_bucket_count\":100,\"type\":\"histogram\"}");
-    debug_log("melvin.c:252", "Initial bucket count (will adapt)", log_data);
-    // #endregion agent log
-    stats->histogram_bucket_count = 100;
-    stats->histogram = (int*)calloc(stats->histogram_bucket_count, sizeof(int));
-    
-    stats->acceptance_bucket_count = 100;
-    stats->acceptance_histogram = (int*)calloc(stats->acceptance_bucket_count, sizeof(int));
-    
-    stats->similarity_bucket_count = 100;
-    stats->similarity_histogram = (int*)calloc(stats->similarity_bucket_count, sizeof(int));
-    
-    stats->edge_weight_bucket_count = 100;
-    stats->edge_weight_histogram = (int*)calloc(stats->edge_weight_bucket_count, sizeof(int));
-}
-
-/* Cleanup wave statistics (free dynamic allocations) */
-static void wave_statistics_cleanup(WaveStatistics *stats) {
-    if (!stats) return;
-    if (stats->histogram) free(stats->histogram);
-    if (stats->acceptance_histogram) free(stats->acceptance_histogram);
-    if (stats->similarity_histogram) free(stats->similarity_histogram);
-    if (stats->edge_weight_histogram) free(stats->edge_weight_histogram);
-    memset(stats, 0, sizeof(WaveStatistics));
-}
 
 /* Forward declarations for adaptive stability functions */
 static float compute_adaptive_epsilon(float value_range);
 static float compute_initial_smoothing(Node *node);
-static int compute_adaptive_bucket_growth_trigger(WaveStatistics *stats, int bucket_count);
-
-/* Ensure histogram has enough buckets for precision (adaptive growth) */
-static void wave_statistics_ensure_bucket_count(WaveStatistics *stats, int *bucket_count, int **histogram) {
-    if (!stats || !bucket_count || !histogram) return;
-    
-    /* DATA-DRIVEN: If we have many values, increase bucket count for better precision */
-    /* Grow when we have adaptive threshold more values than buckets (maintains precision) */
-    /* No maximum - adapts to any data volume */
-    int growth_trigger = compute_adaptive_bucket_growth_trigger(stats, *bucket_count);
-    if (stats->histogram_count > *bucket_count * growth_trigger) {
-        int new_count = *bucket_count * 2;  /* Double bucket count */
-        int *new_histogram = (int*)calloc(new_count, sizeof(int));
-        if (new_histogram) {
-            /* Redistribute existing values proportionally */
-            if (*histogram) {
-                for (int i = 0; i < *bucket_count; i++) {
-                    if ((*histogram)[i] > 0) {
-                        /* Map old bucket to new bucket(s) */
-                        int new_bucket = (i * new_count) / *bucket_count;
-                        new_histogram[new_bucket] += (*histogram)[i];
-                    }
-                }
-                free(*histogram);
-            }
-            *histogram = new_histogram;
-            *bucket_count = new_count;
-        }
-    }
-}
-
-/* Add value to adaptive histogram (O(1)) */
-static void wave_statistics_add_value(WaveStatistics *stats, float value) {
-    if (!stats || !stats->histogram) return;
-    
-    /* DATA-DRIVEN: Ensure bucket count adapts to data volume */
-    wave_statistics_ensure_bucket_count(stats, &stats->histogram_bucket_count, &stats->histogram);
-    
-    /* Update min/max */
-    if (value < stats->value_min) stats->value_min = value;
-    if (value > stats->value_max) stats->value_max = value;
-    
-    /* Bucket the value (adaptive: uses actual min/max range and adaptive bucket count) */
-    if (stats->value_max > stats->value_min && stats->histogram_bucket_count > 0) {
-        float range = stats->value_max - stats->value_min;
-        int bucket = (int)(((value - stats->value_min) / range) * (stats->histogram_bucket_count - 1));
-        if (bucket < 0) bucket = 0;
-        if (bucket >= stats->histogram_bucket_count) bucket = stats->histogram_bucket_count - 1;
-        stats->histogram[bucket]++;
-        stats->histogram_count++;
-    } else if (stats->histogram_count == 0) {
-        stats->value_min = value;
-        stats->value_max = value;
-        if (stats->histogram_bucket_count > 0) {
-            stats->histogram[0]++;
-        }
-        stats->histogram_count++;
-    }
-}
-
-/* Add acceptance strength value (O(1)) */
-static void wave_statistics_add_acceptance(WaveStatistics *stats, float value) {
-    if (!stats || !stats->acceptance_histogram) return;
-    
-    /* DATA-DRIVEN: Ensure bucket count adapts to data volume */
-    wave_statistics_ensure_bucket_count(stats, &stats->acceptance_bucket_count, &stats->acceptance_histogram);
-    
-    if (value < stats->acceptance_min) stats->acceptance_min = value;
-    if (value > stats->acceptance_max) stats->acceptance_max = value;
-    
-    if (stats->acceptance_max > stats->acceptance_min && stats->acceptance_bucket_count > 0) {
-        float range = stats->acceptance_max - stats->acceptance_min;
-        int bucket = (int)(((value - stats->acceptance_min) / range) * (stats->acceptance_bucket_count - 1));
-        if (bucket < 0) bucket = 0;
-        if (bucket >= stats->acceptance_bucket_count) bucket = stats->acceptance_bucket_count - 1;
-        stats->acceptance_histogram[bucket]++;
-        stats->acceptance_count++;
-    } else if (stats->acceptance_count == 0) {
-        stats->acceptance_min = value;
-        stats->acceptance_max = value;
-        if (stats->acceptance_bucket_count > 0) {
-            stats->acceptance_histogram[0]++;
-        }
-        stats->acceptance_count++;
-    }
-}
-
-/* Add similarity value (O(1)) */
-static void wave_statistics_add_similarity(WaveStatistics *stats, float value) {
-    if (!stats || !stats->similarity_histogram) return;
-    
-    /* DATA-DRIVEN: Ensure bucket count adapts to data volume */
-    wave_statistics_ensure_bucket_count(stats, &stats->similarity_bucket_count, &stats->similarity_histogram);
-    
-    if (value < stats->similarity_min) stats->similarity_min = value;
-    if (value > stats->similarity_max) stats->similarity_max = value;
-    
-    if (stats->similarity_max > stats->similarity_min && stats->similarity_bucket_count > 0) {
-        float range = stats->similarity_max - stats->similarity_min;
-        int bucket = (int)(((value - stats->similarity_min) / range) * (stats->similarity_bucket_count - 1));
-        if (bucket < 0) bucket = 0;
-        if (bucket >= stats->similarity_bucket_count) bucket = stats->similarity_bucket_count - 1;
-        stats->similarity_histogram[bucket]++;
-        stats->similarity_count++;
-    } else if (stats->similarity_count == 0) {
-        stats->similarity_min = value;
-        stats->similarity_max = value;
-        if (stats->similarity_bucket_count > 0) {
-            stats->similarity_histogram[0]++;
-        }
-        stats->similarity_count++;
-    }
-}
-
-/* Add edge weight value (O(1)) */
-static void wave_statistics_add_edge_weight(WaveStatistics *stats, float value) {
-    if (!stats || !stats->edge_weight_histogram) return;
-    
-    /* DATA-DRIVEN: Ensure bucket count adapts to data volume */
-    wave_statistics_ensure_bucket_count(stats, &stats->edge_weight_bucket_count, &stats->edge_weight_histogram);
-    
-    if (value < stats->edge_weight_min) stats->edge_weight_min = value;
-    if (value > stats->edge_weight_max) stats->edge_weight_max = value;
-    
-    if (stats->edge_weight_max > stats->edge_weight_min && stats->edge_weight_bucket_count > 0) {
-        float range = stats->edge_weight_max - stats->edge_weight_min;
-        int bucket = (int)(((value - stats->edge_weight_min) / range) * (stats->edge_weight_bucket_count - 1));
-        if (bucket < 0) bucket = 0;
-        if (bucket >= stats->edge_weight_bucket_count) bucket = stats->edge_weight_bucket_count - 1;
-        stats->edge_weight_histogram[bucket]++;
-        stats->edge_weight_count++;
-    } else if (stats->edge_weight_count == 0) {
-        stats->edge_weight_min = value;
-        stats->edge_weight_max = value;
-        if (stats->edge_weight_bucket_count > 0) {
-            stats->edge_weight_histogram[0]++;
-        }
-        stats->edge_weight_count++;
-    }
-}
-
-/* Compute percentile from histogram (O(1) - adaptive bucket count) */
-static float wave_statistics_percentile(int *histogram, int bucket_count, int count, float min_val, float max_val, int percentile) {
-    if (count == 0 || max_val <= min_val || bucket_count == 0 || !histogram) return 0.0f;
-    
-    int target_count = (int)((percentile / 100.0f) * count);
-    int cumulative = 0;
-    
-    for (int i = 0; i < bucket_count; i++) {
-        cumulative += histogram[i];
-        if (cumulative >= target_count) {
-            /* Interpolate within bucket */
-            float range = max_val - min_val;
-            float bucket_start = min_val + (i * range / bucket_count);
-            float bucket_end = min_val + ((i + 1) * range / bucket_count);
-            /* Use midpoint of bucket (relative to bucket range, not hardcoded) */
-            float bucket_midpoint = bucket_start + (bucket_end - bucket_start) / 2.0f;
-            return bucket_midpoint;
-        }
-    }
-    
-    return max_val;
-}
-
-/* Compute all percentiles from histograms (O(1) - called once per wave) */
-static void wave_statistics_compute_percentiles(WaveStatistics *stats) {
-    if (!stats) return;
-    
-    /* General statistics */
-    if (stats->histogram_count > 0 && stats->histogram && stats->histogram_bucket_count > 0) {
-        stats->p25 = wave_statistics_percentile(stats->histogram, stats->histogram_bucket_count, stats->histogram_count,
-                                                 stats->value_min, stats->value_max, 25);
-        stats->p50 = wave_statistics_percentile(stats->histogram, stats->histogram_bucket_count, stats->histogram_count,
-                                                 stats->value_min, stats->value_max, 50);
-        stats->p75 = wave_statistics_percentile(stats->histogram, stats->histogram_bucket_count, stats->histogram_count,
-                                                 stats->value_min, stats->value_max, 75);
-        stats->p90 = wave_statistics_percentile(stats->histogram, stats->histogram_bucket_count, stats->histogram_count,
-                                                 stats->value_min, stats->value_max, 90);
-        stats->p95 = wave_statistics_percentile(stats->histogram, stats->histogram_bucket_count, stats->histogram_count,
-                                                 stats->value_min, stats->value_max, 95);
-    }
-    
-    /* Acceptance statistics */
-    if (stats->acceptance_count > 0 && stats->acceptance_histogram && stats->acceptance_bucket_count > 0) {
-        stats->acceptance_p90 = wave_statistics_percentile(stats->acceptance_histogram, stats->acceptance_bucket_count, stats->acceptance_count,
-                                                           stats->acceptance_min, stats->acceptance_max, 90);
-    } else {
-        stats->acceptance_p90 = 0.0f;  /* No data = no threshold */
-    }
-    
-    /* Similarity statistics */
-    if (stats->similarity_count > 0 && stats->similarity_histogram && stats->similarity_bucket_count > 0) {
-        stats->similarity_p75 = wave_statistics_percentile(stats->similarity_histogram, stats->similarity_bucket_count, stats->similarity_count,
-                                                           stats->similarity_min, stats->similarity_max, 75);
-    } else {
-        stats->similarity_p75 = 0.0f;  /* No data = no threshold */
-    }
-    
-    /* Edge weight statistics */
-    if (stats->edge_weight_count > 0 && stats->edge_weight_histogram && stats->edge_weight_bucket_count > 0) {
-        stats->edge_weight_p25 = wave_statistics_percentile(stats->edge_weight_histogram, stats->edge_weight_bucket_count, stats->edge_weight_count,
-                                                             stats->edge_weight_min, stats->edge_weight_max, 25);
-        stats->edge_weight_p75 = wave_statistics_percentile(stats->edge_weight_histogram, stats->edge_weight_bucket_count, stats->edge_weight_count,
-                                                             stats->edge_weight_min, stats->edge_weight_max, 75);
-    } else {
-        stats->edge_weight_p25 = 0.0f;
-        stats->edge_weight_p75 = 0.0f;
-    }
-}
 
 /* ========================================
  * UTILITY FUNCTIONS
@@ -565,19 +265,20 @@ Node* node_create(const uint8_t *payload_data, size_t payload_size) {
     node->incoming_weight_sum = 0.0f;
     
     /* Initialize adaptive learning rate tracking */
-    /* DATA-DRIVEN: Start with reasonable default, will adapt based on change rate */
-    node->weight_change_capacity = 4;  /* Initial size */
+    /* RELATIVE: Use minimal context - start with 1, grows immediately like nature */
+    node->weight_change_capacity = 1;  /* Absolute minimum, grows immediately when data arrives */
     node->weight_change_count = 0;
     node->recent_weight_changes = (float*)calloc(node->weight_change_capacity, sizeof(float));
     node->weight_change_index = 0;
     node->change_rate_avg = 0.0f;
     
     /* Initialize edge arrays */
-    node->outgoing_capacity = 4;
+    /* RELATIVE: Use minimal context - start with 1, grows immediately like nature */
+    node->outgoing_capacity = 1;  /* Absolute minimum, grows immediately when edges added */
     node->outgoing_edges = (Edge**)calloc(node->outgoing_capacity, sizeof(Edge*));
     node->outgoing_count = 0;
     
-    node->incoming_capacity = 4;
+    node->incoming_capacity = 1;  /* Absolute minimum, grows immediately when edges added */
     node->incoming_edges = (Edge**)calloc(node->incoming_capacity, sizeof(Edge*));
     node->incoming_count = 0;
     
@@ -661,20 +362,10 @@ static size_t compute_adaptive_sample_limit(size_t total_count, size_t min_sampl
 static float compute_adaptive_epsilon(float value_range) {
     /* NO FALLBACK: When no data exists, return neutral value (0.0f = no operation) */
     if (value_range <= 0.0f) {
-        // #region agent log
-        char log_eps[128];
-        snprintf(log_eps, sizeof(log_eps), "{\"hypothesisId\":\"A\",\"value_range\":%.6f,\"return_value\":0,\"reason\":\"no_data\"}", value_range);
-        debug_log("melvin.c:662", "Epsilon returning 0.0f (no data)", log_eps);
-        // #endregion agent log
         return 0.0f;  /* Neutral: no operation possible without data */
     }
     /* Epsilon adapts to 0.1% of the value range (scales with data) */
     float adaptive_epsilon = value_range * 0.001f;
-    // #region agent log
-    char log_eps2[128];
-    snprintf(log_eps2, sizeof(log_eps2), "{\"hypothesisId\":\"B\",\"value_range\":%.6f,\"epsilon\":%.6f}", value_range, adaptive_epsilon);
-    debug_log("melvin.c:668", "Computed epsilon (data-driven)", log_eps2);
-    // #endregion agent log
     /* Use computed epsilon (data-driven, no hardcoded minimum) */
     return adaptive_epsilon;
 }
@@ -691,13 +382,24 @@ static float compute_adaptive_clip_bound(float *values, size_t count) {
         /* All values are zero: return 0.0f (no operation) */
         return 0.0f;
     }
-    /* Clip to 2x the 95th percentile (allows outliers but prevents extremes) */
-    return p95 * 2.0f;
+    
+    /* RELATIVE: Compute multiplier from data distribution instead of hardcoded 2.0f */
+    /* Use ratio of higher percentile to p95 as multiplier */
+    float p99 = compute_percentile_from_array(values, count, 99);
+    if (p99 > 0.0f && p95 > 0.0f) {
+        float epsilon = compute_adaptive_epsilon(p95);
+        float multiplier = p99 / (p95 + epsilon);
+        /* Ensure reasonable multiplier: use p99/p95 ratio as data-driven multiplier */
+        return p95 * multiplier;
+    }
+    
+    /* Fallback: if can't compute ratio, use p95 itself (no operation beyond data) */
+    return p95;
 }
 
 /* Compute adaptive smoothing factor based on change rate */
 static float compute_adaptive_smoothing_factor(Node *node) {
-    if (!node) return compute_initial_smoothing(node);  /* Adaptive initial smoothing */
+    if (!node) return 0.0f;  /* No node = no smoothing */
     
     if (node->weight_change_count == 0) return compute_initial_smoothing(node);  /* Adaptive initial smoothing */
     
@@ -710,35 +412,27 @@ static float compute_adaptive_smoothing_factor(Node *node) {
     if (local_avg > 0.0f) {
         float epsilon = compute_adaptive_epsilon(local_avg);
         float denominator = local_avg + epsilon;
-        // #region agent log
-        char log_div[256];
-        snprintf(log_div, sizeof(log_div), "{\"hypothesisId\":\"A\",\"local_avg\":%.6f,\"epsilon\":%.6f,\"denominator\":%.6f,\"change_rate\":%.6f}", local_avg, epsilon, denominator, change_rate);
-        debug_log("melvin.c:699", "Epsilon usage in division", log_div);
-        // #endregion agent log
         float relative_change = change_rate / denominator;
-        /* High relative change → low smoothing (0.1), low change → high smoothing (0.9) */
+        /* High relative change → low smoothing, low change → high smoothing */
         float smoothing = 1.0f - relative_change;
-        // #region agent log
-        char log_clip1[256];
-        snprintf(log_clip1, sizeof(log_clip1), "{\"hypothesisId\":\"A\",\"local_avg\":%.3f,\"smoothing_before_clip\":%.3f,\"clipping_range\":\"0.1-0.9\"}", local_avg, smoothing);
-        debug_log("melvin.c:720", "Smoothing factor before clipping", log_clip1);
-        // #endregion agent log
-        return fmaxf(0.1f, fminf(0.9f, smoothing));
+        
+        /* RELATIVE: Clip using local context instead of hardcoded bounds */
+        /* Use local average as context for smoothing range */
+        float local_smoothing_range = local_avg;
+        float min_smoothing = local_smoothing_range / (local_smoothing_range + 1.0f);
+        float max_smoothing = 1.0f - min_smoothing;
+        
+        /* Clip relative to local context range */
+        return fmaxf(min_smoothing, fminf(smoothing, max_smoothing));
     }
     return compute_initial_smoothing(node);  /* Adaptive initial smoothing */
 }
 
 /* Compute adaptive minimum sample size based on data variance */
 static size_t compute_adaptive_min_samples(float *values, size_t count) {
-    // #region agent log
     if (!values || count == 0) {
-        char log_data[128];
-        snprintf(log_data, sizeof(log_data), "{\"hypothesisId\":\"B\",\"return_value\":3,\"reason\":\"no_data_for_variance\"}");
-        debug_log("melvin.c:697", "Hardcoded minimum default return", log_data);
-        // #endregion agent log
-        return 3;  /* Minimum default */
+        return 1;  /* Minimal context: absolute minimum, grows immediately when data arrives */
     }
-    // #endregion agent log
     
     if (count < 2) return count;  /* Can't compute variance with < 2 samples */
     
@@ -759,11 +453,6 @@ static size_t compute_adaptive_min_samples(float *values, size_t count) {
     /* Normalize variance (relative to mean) */
     float epsilon_var = (mean > 0.0f) ? compute_adaptive_epsilon(mean) : 0.0f;
     float denominator_var = (mean > 0.0f) ? (mean * mean + epsilon_var) : 1.0f;
-    // #region agent log
-    char log_var[256];
-    snprintf(log_var, sizeof(log_var), "{\"hypothesisId\":\"A\",\"mean\":%.6f,\"epsilon\":%.6f,\"denominator\":%.6f,\"variance\":%.6f}", mean, epsilon_var, denominator_var, variance);
-    debug_log("melvin.c:742", "Epsilon usage in variance normalization", log_var);
-    // #endregion agent log
     float normalized_variance = (mean > 0.0f) ? variance / denominator_var : variance;
     float variance_factor = fminf(1.0f, normalized_variance);
     
@@ -776,13 +465,17 @@ static size_t compute_adaptive_min_samples(float *values, size_t count) {
     float range = max_val - min_val;
     float relative_range = (mean > 0.0f) ? range / (mean + compute_adaptive_epsilon(mean)) : range;
     
-    /* Base range: 2-12 (adapts to data spread) */
-    float base_min = 2.0f;
-    float base_max = 12.0f;
+    /* RELATIVE: Compute base range from data characteristics instead of hardcoded values */
+    /* Use mean as anchor for base range computation */
+    float base_range = (mean > 0.0f) ? mean : 1.0f;  /* Use mean as anchor */
+    float base_min = base_range / (base_range + 1.0f);  /* Normalized min using x / (x + 1.0f) */
+    float base_max = base_range;  /* Max relative to data scale */
+    
     float range_contribution = fminf(relative_range, 1.0f) * (base_max - base_min);
     
     /* Combine variance factor with range contribution */
     float min_samples_float = base_min + (variance_factor * range_contribution);
+    /* Clip using computed base range instead of hardcoded values */
     size_t min_samples = (size_t)fmaxf(base_min, fminf(min_samples_float, base_max));
     
     return fminf(min_samples, count);  /* Don't exceed available samples */
@@ -830,11 +523,16 @@ static float compute_well_connected_threshold(Node *node) {
 /* Compute adaptive confidence increase from observed confidence distribution (relative adaptive stability) */
 static float compute_adaptive_confidence_increase(float *observed_confidences, size_t count, size_t current_step) {
     if (!observed_confidences || count == 0) {
-        /* No data: use conservative increase based on step number */
-        /* Increase rate adapts: early steps more permissive, later steps stricter */
-        float base_increase = 0.05f;  /* 5% base */
-        float step_factor = (float)current_step * 0.01f;  /* +1% per step */
-        return fminf(base_increase + step_factor, 0.2f);  /* Cap at 20% */
+        /* NO FALLBACK: Use minimal context from step number or return 0.0f */
+        /* Step number provides minimal context for relative computation */
+        if (current_step == 0) return 0.0f;  /* No operation at step 0 */
+        
+        /* RELATIVE: Compute increase relative to step number itself */
+        /* Use x / (x + 1.0f) pattern: early steps get more, later steps get less */
+        float step_factor = (float)current_step / ((float)current_step + 1.0f);
+        float base_increase = step_factor / (step_factor + 10.0f);  /* Normalize to small range */
+        
+        return base_increase;  /* Relative to step count, no hardcoded cap */
     }
     
     /* Compute how much confidence typically changes between steps */
@@ -846,20 +544,21 @@ static float compute_adaptive_confidence_increase(float *observed_confidences, s
         float median_change = compute_median_adaptive(changes, count - 1);
         free(changes);
         
-        /* Increase rate adapts to observed change rate */
+        /* RELATIVE: Increase rate adapts to observed change rate */
         float range = (count > 0) ? 
             (compute_percentile_from_array(observed_confidences, count, 100) - 
-             compute_percentile_from_array(observed_confidences, count, 0)) : 1.0f;
+             compute_percentile_from_array(observed_confidences, count, 0)) : 0.0f;
+        
+        if (range <= 0.0f) return 0.0f;  /* No range = no operation */
+        
         float epsilon = compute_adaptive_epsilon(range);
-        return fminf(median_change / (range + epsilon), 0.2f);  /* Cap at 20% */
+        /* RELATIVE: Normalize using x / (x + 1.0f) pattern instead of hardcoded cap */
+        float relative_increase = median_change / (range + epsilon);
+        return relative_increase / (relative_increase + 1.0f);  /* Self-normalizing */
     }
     
-    // #region agent log
-    char log_data[256];
-    snprintf(log_data, sizeof(log_data), "{\"hypothesisId\":\"B\",\"return_value\":0.1,\"reason\":\"no_observed_confidences\"}");
-    debug_log("melvin.c:806", "Hardcoded default return value", log_data);
-    // #endregion agent log
-    return 0.1f;  /* Default moderate increase */
+    /* NO FALLBACK: Return 0.0f (neutral) when insufficient data */
+    return 0.0f;
 }
 
 /* Compute adaptive exploration steps based on graph size and context (relative adaptive stability) */
@@ -873,17 +572,15 @@ static size_t compute_adaptive_exploration_steps(MelvinGraph *g, size_t seed_cou
         base_steps = (size_t)log2f((float)g->node_count) + 1;
     }
     
-    /* Adjust based on seed count (more seeds = can explore less per seed) */
-    float seed_factor = (seed_count > 0) ? 1.0f / (1.0f + (float)seed_count * 0.1f) : 1.0f;
+    /* RELATIVE: Compute seed factor relative to seed count itself */
+    /* Use x / (x + 1.0f) pattern instead of hardcoded 0.1f */
+    float seed_context = (float)seed_count;
+    float seed_factor = seed_context / (seed_context + 1.0f);  /* x / (x + 1.0f) pattern */
     size_t adaptive_steps = (size_t)((float)base_steps * seed_factor);
     
-    /* Ensure minimum of 1, maximum reasonable limit */
-    // #region agent log
-    char log_data[256];
-    snprintf(log_data, sizeof(log_data), "{\"hypothesisId\":\"A\",\"adaptive_steps_before_clip\":%zu,\"clipping_range\":\"1-16\",\"node_count\":%zu}", adaptive_steps, g->node_count);
-    debug_log("melvin.c:825", "Exploration steps before clipping", log_data);
-    // #endregion agent log
-    return fmaxf(1, fminf(adaptive_steps, 16));  /* Cap at 16 for performance */
+    /* RELATIVE: No hardcoded cap - steps computed from graph size and seed count */
+    /* Ensure minimum of 1 (minimal context) */
+    return fmaxf(1, adaptive_steps);
 }
 
 /* Compute initial smoothing from available data (relative adaptive stability, no fallbacks) */
@@ -899,35 +596,35 @@ static float compute_initial_smoothing(Node *node) {
         float range = fmaxf(node->weight, local_avg);
         float epsilon_smooth = compute_adaptive_epsilon(range);
         float denominator_smooth = local_avg + epsilon_smooth;
-        // #region agent log
-        char log_smooth[256];
-        snprintf(log_smooth, sizeof(log_smooth), "{\"hypothesisId\":\"A\",\"range\":%.6f,\"epsilon\":%.6f,\"local_avg\":%.6f,\"denominator\":%.6f,\"node_weight\":%.6f}", range, epsilon_smooth, local_avg, denominator_smooth, node->weight);
-        debug_log("melvin.c:876", "Epsilon usage in initial smoothing", log_smooth);
-        // #endregion agent log
         float relative_weight = node->weight / denominator_smooth;
         
-        /* Close to average → more smoothing (0.7), far from average → less smoothing (0.3) */
-        float smoothing = 0.5f + (1.0f - fminf(relative_weight, 2.0f) / 2.0f) * 0.2f;
-        // #region agent log
-        char log_clip2[256];
-        snprintf(log_clip2, sizeof(log_clip2), "{\"hypothesisId\":\"A\",\"smoothing_before_clip\":%.3f,\"clipping_range\":\"0.3-0.7\",\"node_weight\":%.3f,\"local_avg\":%.3f}", smoothing, node->weight, local_avg);
-        debug_log("melvin.c:909", "Initial smoothing before clipping", log_clip2);
-        // #endregion agent log
-        return fmaxf(0.3f, fminf(smoothing, 0.7f));  /* Range: 0.3-0.7 */
+        /* RELATIVE: Compute smoothing from relative weight, using data-driven values */
+        /* Close to average → more smoothing, far from average → less smoothing */
+        /* Compute base smoothing from relative_weight itself using normalization pattern */
+        float base_smoothing = relative_weight / (relative_weight + 1.0f);  /* Normalize: 0.0f to 1.0f */
+        
+        /* RELATIVE: Compute adjustment factor from how close relative_weight is to 1.0f (average) */
+        /* When close to 1.0f, adjustment is larger (more smoothing) */
+        float distance_from_avg = fabsf(relative_weight - 1.0f);
+        float adjustment_factor = 1.0f / (distance_from_avg + 1.0f);  /* Larger when distance is small */
+        
+        /* Combine base smoothing with adjustment based on distance from average */
+        float smoothing_base = base_smoothing + (adjustment_factor * (1.0f - base_smoothing));
+        
+        /* Clip using relative normalization from local context */
+        float min_bound = local_avg / (local_avg + 1.0f);
+        float max_bound = 1.0f - min_bound;
+        
+        return fmaxf(min_bound, fminf(smoothing_base, max_bound));
     }
     
     /* No local context: use node's own properties as minimal context */
     if (node->weight > 0.0f) {
         /* Use node's own weight as minimal context */
         float range = node->weight;
-        float epsilon = compute_adaptive_epsilon(range);
-        /* Compute smoothing from node's weight relative to itself (neutral) */
-        // #region agent log
-        char log_data[256];
-        snprintf(log_data, sizeof(log_data), "{\"hypothesisId\":\"B\",\"return_value\":0.5,\"reason\":\"only_node_weight_available\",\"node_weight\":%.3f}", node->weight);
-        debug_log("melvin.c:853", "Neutral return value (minimal context)", log_data);
-        // #endregion agent log
-        return 0.5f;  /* Neutral when only node weight available */
+        /* RELATIVE: Use normalization pattern instead of hardcoded 0.5f */
+        /* Compute smoothing from node's weight relative to itself */
+        return range / (range + 1.0f);  /* Normalize using x / (x + 1.0f) pattern */
     }
     
     /* Use node's connection count as minimal context */
@@ -943,37 +640,6 @@ static float compute_initial_smoothing(Node *node) {
 
 
 /* Compute adaptive bucket growth trigger based on data variance (relative adaptive stability, no fallbacks) */
-static int compute_adaptive_bucket_growth_trigger(WaveStatistics *stats, int bucket_count) {
-    if (!stats || bucket_count == 0) {
-        /* No stats or no buckets: use minimal context from bucket_count itself */
-        return (bucket_count > 0) ? bucket_count : 1;  /* Use bucket_count as minimal context */
-    }
-    
-    /* High variance → need more buckets → grow sooner */
-    /* Low variance → fewer buckets sufficient → grow later */
-    float range = stats->value_max - stats->value_min;
-    float mean = (stats->value_max + stats->value_min) / 2.0f;
-    
-    if (mean > 0.0f && range > 0.0f) {
-        float coefficient_of_variation = range / (mean + compute_adaptive_epsilon(mean));
-        
-        /* High CV → grow at 5x, low CV → grow at 15x */
-        int growth_trigger = (int)(5.0f + (1.0f - fminf(coefficient_of_variation, 1.0f)) * 10.0f);
-        // #region agent log
-        char log_data[256];
-        snprintf(log_data, sizeof(log_data), "{\"hypothesisId\":\"A\",\"growth_trigger_before_clip\":%d,\"clipping_range\":\"5-20\",\"cv\":%.3f,\"mean\":%.3f,\"range\":%.3f}", growth_trigger, coefficient_of_variation, mean, range);
-        debug_log("melvin.c:885", "Bucket growth trigger before clipping", log_data);
-        // #endregion agent log
-        return fmaxf(5, fminf(growth_trigger, 20));  /* Range: 5-20x */
-    }
-    
-    // #region agent log
-    char log_data[256];
-    snprintf(log_data, sizeof(log_data), "{\"hypothesisId\":\"B\",\"return_value\":10,\"reason\":\"no_data_for_cv_computation\",\"bucket_count\":%d}", bucket_count);
-    debug_log("melvin.c:888", "Hardcoded default return value", log_data);
-    // #endregion agent log
-    return 10;  /* Default */
-}
 
 /* Adapt rolling window size based on observed change rate (self-regulating) */
 static void node_adapt_rolling_window(Node *node) {
@@ -990,8 +656,8 @@ static void node_adapt_rolling_window(Node *node) {
     /* DATA-DRIVEN: Adapt window size based on change rate */
     /* Fast changes (high rate) → smaller window (focus on recent) */
     /* Slow changes (low rate) → larger window (need more history) */
-    /* Compute threshold from actual change rates observed */
-    size_t optimal_size = 4;  /* Minimum size */
+    /* RELATIVE: Compute window size from data, not hardcoded values */
+    size_t optimal_size = 1;  /* Start with minimum, compute from data */
     if (node->weight_change_count > 1) {
         /* Use median of observed changes as threshold */
         float *sorted = (float*)malloc(node->weight_change_count * sizeof(float));
@@ -1001,33 +667,65 @@ static void node_adapt_rolling_window(Node *node) {
             float median_change = sorted[node->weight_change_count / 2];
             free(sorted);
             
-            /* Window size adapts to median change rate */
-            if (avg_change > median_change) {
-        optimal_size = 4;  /* Fast changes: small window */
-            } else if (avg_change > median_change / 2.0f) {
-        optimal_size = 8;  /* Medium changes: medium window */
-    } else {
-        optimal_size = 16;  /* Slow changes: large window */
+            /* RELATIVE: Compute window size from change rate relative to median */
+            /* Use change rate relative to median to determine window size */
+            if (median_change > 0.0f) {
+                float relative_rate = avg_change / (median_change + compute_adaptive_epsilon(median_change));
+                
+                /* Window size scales inversely with relative change rate */
+                /* High relative rate → smaller window, low relative rate → larger window */
+                /* Use x / (x + 1.0f) pattern for normalization */
+                float window_factor = relative_rate / (relative_rate + 1.0f);
+                /* Invert: high rate → small window, so use (1 - factor) */
+                float window_scale = 1.0f - window_factor;
+                
+                /* Compute base window size from current data count */
+                /* Window size relative to data available */
+                size_t base_window = node->weight_change_count;
+                /* Scale window based on relative change rate */
+                optimal_size = (size_t)(base_window * window_scale);
+                /* Ensure minimum of 1 */
+                if (optimal_size < 1) optimal_size = 1;
+                /* Cap at reasonable maximum relative to data count */
+                if (optimal_size > base_window) optimal_size = base_window;
+            } else {
+                /* Median is zero: use minimal context (data count itself) */
+                optimal_size = (node->weight_change_count > 1) ? node->weight_change_count : 1;
             }
         }
     } else if (node->weight_change_count == 1) {
-        /* Only one value - use it as threshold */
+        /* RELATIVE: Single value - use it as minimal context */
+        /* Window size relative to single observed value */
         float single_change = node->recent_weight_changes[0];
-        if (avg_change > single_change) {
-            optimal_size = 4;
+        if (single_change > 0.0f && avg_change > 0.0f) {
+            /* Compute relative to single change */
+            float relative_rate = avg_change / (single_change + compute_adaptive_epsilon(single_change));
+            float window_factor = relative_rate / (relative_rate + 1.0f);
+            float window_scale = 1.0f - window_factor;
+            optimal_size = (size_t)(node->weight_change_count * window_scale);
+            if (optimal_size < 1) optimal_size = 1;
         } else {
-            optimal_size = 8;
+            optimal_size = 1;  /* Minimal context: one data point */
         }
     } else {
-        /* No history - compute from node's current state relative to neighbors */
+        /* RELATIVE: No history - compute from node's current state relative to neighbors */
         float local_avg = (node_get_local_outgoing_weight_avg(node) + 
                           node_get_local_incoming_weight_avg(node)) / 2.0f;
         float baseline = (node->weight > 0.0f && local_avg > 0.0f) ?
                         (node->weight + local_avg) / 2.0f : node->weight;
-        if (avg_change > baseline) {
-            optimal_size = 4;
+        
+        if (baseline > 0.0f && avg_change > 0.0f) {
+            /* Compute window size relative to baseline */
+            float relative_rate = avg_change / (baseline + compute_adaptive_epsilon(baseline));
+            float window_factor = relative_rate / (relative_rate + 1.0f);
+            float window_scale = 1.0f - window_factor;
+            
+            /* Use node weight as minimal context for window size */
+            float weight_context = (node->weight > 0.0f) ? node->weight : 1.0f;
+            optimal_size = (size_t)(weight_context * window_scale);
+            if (optimal_size < 1) optimal_size = 1;
         } else {
-            optimal_size = 8;
+            optimal_size = 1;  /* Minimal context when no data */
         }
     }
     
@@ -1115,12 +813,6 @@ static float node_get_adaptive_learning_rate(Node *node) {
     }
     float context_weight = 1.0f - history_weight;
     float result = median_rate * history_weight + context_rate * context_weight;
-    // #region agent log
-    char log_data[256];
-    snprintf(log_data, sizeof(log_data), "{\"history_weight\":%.3f,\"context_weight\":%.3f,\"result\":%.3f,\"history_count\":%zu}",
-             history_weight, context_weight, result, node->weight_change_count);
-    debug_log("melvin.c:675", "Adaptive learning rate computed", log_data);
-    // #endregion agent log
     return result;
 }
 
@@ -1373,31 +1065,34 @@ void edge_update_weight_local(Edge *edge) {
             if (edge->weight > 0.0f) {
                 rate = edge->weight / (edge->weight + 1.0f);  /* Compute from edge weight */
             } else {
-                /* No weight yet: use minimal bootstrap rate to allow learning (not a threshold, just bootstrap) */
-                /* Use source node's activation_strength if available, otherwise minimal rate */
+                /* No weight yet: use source node's activation_strength relative to local context */
                 if (edge->from_node->activation_strength > 0.0f) {
-                    rate = edge->from_node->activation_strength * 0.1f;  /* Scale activation for learning rate */
-                    // #region agent log
-                    char log_data[256];
-                    snprintf(log_data, sizeof(log_data), "{\"hypothesisId\":\"D\",\"rate\":%.3f,\"source\":\"activation_strength\",\"activation\":%.3f,\"factor\":0.1}", rate, edge->from_node->activation_strength);
-                    debug_log("melvin.c:1291", "Learning rate from activation (data-driven)", log_data);
-                    // #endregion agent log
+                    /* RELATIVE: Compute learning rate from activation relative to local context */
+                    float local_avg = node_get_local_outgoing_weight_avg(edge->from_node);
+                    if (local_avg > 0.0f) {
+                        /* Use activation relative to local average */
+                        float epsilon = compute_adaptive_epsilon(local_avg);
+                        float relative_activation = edge->from_node->activation_strength / 
+                                                   (local_avg + epsilon);
+                        rate = relative_activation / (relative_activation + 1.0f);  /* Normalize */
+                    } else {
+                        /* No local context: use activation itself with normalization */
+                        rate = edge->from_node->activation_strength / 
+                              (edge->from_node->activation_strength + 1.0f);
+                    }
                 } else {
-                    rate = 0.1f;  /* Minimal bootstrap rate to allow learning */
-                    // #region agent log
-                    char log_data[256];
-                    snprintf(log_data, sizeof(log_data), "{\"hypothesisId\":\"D\",\"rate\":0.1,\"source\":\"bootstrap\",\"reason\":\"no_activation_available\"}");
-                    debug_log("melvin.c:1294", "Bootstrap learning rate (minimal context)", log_data);
-                    // #endregion agent log
+                    /* NO FALLBACK: Return 0.0f (neutral) when no activation available */
+                    rate = 0.0f;
                 }
             }
         }
     } else {
-        /* No from_node: compute from edge weight or use minimal bootstrap */
+        /* No from_node: compute from edge weight or return neutral */
         if (edge->weight > 0.0f) {
             rate = edge->weight / (edge->weight + 1.0f);
         } else {
-            rate = 0.1f;  /* Minimal bootstrap rate */
+            /* NO FALLBACK: Return 0.0f (neutral) when no data available */
+            rate = 0.0f;
         }
     }
     
@@ -1453,6 +1148,59 @@ static Edge* node_find_edge_to(Node *from, Node *to) {
     }
     
     return NULL;
+}
+
+/* Find edge between two nodes using LOCAL knowledge only (O(1) average, no global scan) */
+/* Checks from node's local edge arrays (both outgoing and incoming) - node knows ALL edges connected to it */
+/* This ensures we catch edges in either direction (A->B or B->A) using only local operations */
+static Edge* node_find_edge_bidirectional_local(Node *from, Node *to) {
+    if (!from || !to) return NULL;
+    
+    /* Check from node's outgoing edges (from knows edges where it's the source) */
+    for (size_t i = 0; i < from->outgoing_count; i++) {
+        Edge *edge = from->outgoing_edges[i];
+        if (edge && edge->to_node == to) {
+            return edge;  /* Found from->to */
+        }
+    }
+    
+    /* Check from node's incoming edges (from knows edges where it's the target) */
+    /* If there's an edge to->from, it's in from's incoming_edges */
+    for (size_t i = 0; i < from->incoming_count; i++) {
+        Edge *edge = from->incoming_edges[i];
+        if (edge && edge->from_node == to) {
+            return edge;  /* Found to->from (reverse direction) */
+        }
+    }
+    
+    return NULL;  /* No edge found in either direction */
+}
+
+
+/* Compute relative initial edge weight based on local context (no hardcoded values) */
+/* RELATIVE: Weight is computed from source node activation relative to local context */
+/* Returns 0.0f when no data is available (neutral, not a hardcoded fallback) */
+static float compute_relative_initial_edge_weight(Node *from_node, float similarity_factor) {
+    if (!from_node) return 0.0f;
+    
+    /* Use activation strength from source node (data-driven) */
+    float activation = from_node->activation_strength;
+    if (activation <= 0.0f) return 0.0f;
+    
+    /* Get local context (average outgoing edge weight) */
+    float local_avg = node_get_local_outgoing_weight_avg(from_node);
+    
+    /* RELATIVE: Compute initial weight relative to local context */
+    if (local_avg > 0.0f) {
+        /* Normalize activation relative to local average */
+        float relative_activation = activation / (local_avg + activation);
+        /* Scale by similarity factor (for similarity/context edges) or just use relative activation */
+        return relative_activation * similarity_factor;
+    } else {
+        /* No local context: normalize activation itself */
+        float normalized_activation = activation / (activation + 1.0f);
+        return normalized_activation * similarity_factor;
+    }
 }
 
 /* Compute context similarity based on recent path (paths recently traveled) */
@@ -1598,13 +1346,17 @@ static bool edge_is_node_isolated(Node *node) {
                 float epsilon = compute_adaptive_epsilon(range);
                 float ratio = connections[0] / (node_connections + epsilon);
                 
-                /* Use the ratio itself, but cap conservatively */
-                /* If neighbor has many more connections, use smaller fraction */
-                relative_fraction = fminf(ratio, 0.75f);  /* Cap at 75% */
+                /* RELATIVE: Compute cap from ratio itself using normalization pattern */
+                /* Cap prevents ratio from dominating when neighbor has many more connections */
+                float ratio_cap = ratio / (ratio + 1.0f);  /* Normalize: always < 1.0f */
+                relative_fraction = fminf(ratio, ratio_cap);
                 
-                /* If node has more connections, use larger fraction */
+                /* RELATIVE: Compute minimum from local context (connections comparison) */
+                /* If node has more connections, use larger fraction computed from data */
                 if (node_connections > connections[0]) {
-                    relative_fraction = fmaxf(relative_fraction, 0.25f);  /* At least 25% */
+                    /* Compute minimum from the ratio itself: inverse of cap pattern */
+                    float min_fraction = 1.0f / (ratio + 1.0f);  /* Inverse normalization */
+                    relative_fraction = fmaxf(relative_fraction, min_fraction);
                 }
             } else if (connections[0] > 0.0f) {
                 /* Node has no connections: compute from neighbor's connections alone */
@@ -1624,8 +1376,11 @@ static bool edge_is_node_isolated(Node *node) {
                 float range = fmaxf(node_connections, neighbor_avg);
                 float epsilon = compute_adaptive_epsilon(range);
                 float ratio = node_connections / (neighbor_avg + epsilon);
+                /* RELATIVE: Compute cap from ratio itself to prevent explosion */
+                /* When ratio > 1.0f, normalize it to prevent threshold from exceeding node_connections */
+                float ratio_cap = (ratio > 1.0f) ? (1.0f + 1.0f / (ratio + 1.0f)) : ratio;
                 /* Threshold is node's connections scaled by its relative position */
-                isolation_threshold = node_connections * fminf(ratio, 1.0f);  /* Cap at 1.0 to prevent explosion */
+                isolation_threshold = node_connections * fminf(ratio, ratio_cap);
             } else {
                 isolation_threshold = node_connections;
             }
@@ -1713,11 +1468,15 @@ float edge_transform_activation(Edge *edge, float input_activation) {
                 }
                 free(edge_weights);
             } else {
-                primary_threshold = 1.0f;  /* No data = no boost */
+                /* NO FALLBACK: Return 0.0f (neutral) when no data = no boost */
+                primary_threshold = 0.0f;
             }
-            if (edge_relative > primary_threshold) {
-                /* Boost amount adapts to how much stronger the edge is */
-                float boost_factor = 1.0f + ((edge_relative - primary_threshold) / (edge_relative + 1.0f));
+            /* Only apply boost if we have data (threshold > 0.0f) and edge is stronger */
+            if (primary_threshold > 0.0f && edge_relative > primary_threshold) {
+                /* RELATIVE: Boost amount adapts relative to edge strength itself */
+                /* Use edge_relative as context for boost computation */
+                float boost_base = edge_relative / (edge_relative + 1.0f);  /* Normalize */
+                float boost_factor = 1.0f + boost_base;  /* Boost relative to edge strength */
                 transformed *= boost_factor;
             }
         }
@@ -1902,8 +1661,10 @@ static Node* wave_find_accepting_blank_node(MelvinGraph *g, Node **seed_nodes, s
                                     float epsilon = compute_adaptive_epsilon(range);
                                     /* Cap based on how much weight exceeds local average */
                                     max_ratio = candidate->weight / (local_avg + epsilon);
-                                    /* Use adaptive clipping: cap at 2x the computed ratio */
-                                    max_ratio = max_ratio * 2.0f;
+                                    /* RELATIVE: Compute multiplier from ratio itself using normalization pattern */
+                                    /* Multiplier approaches 2.0f as ratio increases, but is data-driven */
+                                    float multiplier = 1.0f + (max_ratio / (max_ratio + 1.0f));  /* Between 1.0f and 2.0f */
+                                    max_ratio = max_ratio * multiplier;
                                 } else if (candidate->weight > 0.0f) {
                                     /* Only weight available: use weight as minimal context */
                                     max_ratio = candidate->weight * 2.0f;
@@ -1925,7 +1686,8 @@ static Node* wave_find_accepting_blank_node(MelvinGraph *g, Node **seed_nodes, s
                     
                     /* Store blank candidate with priority */
                     if (blank_count >= blank_capacity) {
-                        blank_capacity = (blank_capacity == 0) ? 4 : blank_capacity * 2;
+                        /* RELATIVE: Start from 1, grows immediately like nature */
+                        blank_capacity = (blank_capacity == 0) ? 1 : blank_capacity * 2;
                         blank_candidates = (Node**)realloc(blank_candidates, blank_capacity * sizeof(Node*));
                         blank_priorities = (float*)realloc(blank_priorities, blank_capacity * sizeof(float));
                         if (!blank_candidates || !blank_priorities) {
@@ -1972,7 +1734,7 @@ static Node* wave_find_accepting_blank_node(MelvinGraph *g, Node **seed_nodes, s
                 
                 /* Add to next wave front (regular nodes still explored, but blanks prioritized) */
                 if (next_size >= next_capacity) {
-                    next_capacity = (next_capacity == 0) ? 4 : next_capacity * 2;
+                    next_capacity = (next_capacity == 0) ? 1 : next_capacity * 2;  /* Minimal context: start at 1 */
                     next_wave_front = (Node**)realloc(next_wave_front, next_capacity * sizeof(Node*));
                     if (!next_wave_front) {
                         if (blank_candidates) free(blank_candidates);
@@ -2026,6 +1788,7 @@ static Node* wave_find_accepting_blank_node(MelvinGraph *g, Node **seed_nodes, s
 static Node* wave_find_node_via_exploration(MelvinGraph *g, Node **seed_nodes, size_t seed_count,
                                              const uint8_t *pattern, size_t pattern_size, 
                                              size_t max_steps, WaveStatistics *stats) {
+    (void)stats;  /* No longer used - kept for backward compatibility */
     if (!g || !seed_nodes || seed_count == 0 || max_steps == 0) return NULL;
     
     /* Initialize wave front with seed nodes */
@@ -2097,68 +1860,43 @@ static Node* wave_find_node_via_exploration(MelvinGraph *g, Node **seed_nodes, s
                 /* 1. Size-based priority: Prefer nodes that can match the pattern (universal - all nodes) */
                 if (candidate->payload_size >= pattern_size) {
                     if (candidate->payload_size == pattern_size) {
-                        /* Exact match priority - from stats or node properties */
-                        float exact_match_boost = 0.0f;
-                        if (stats && stats->histogram_count > 0) {
-                            exact_match_boost = stats->p90;  /* 90th percentile */
-                        } else {
-                            /* Compute from candidate's actual properties */
-                            float node_strength = candidate->weight * 
-                                                 (candidate->outgoing_count + candidate->incoming_count + 1);
-                            exact_match_boost = node_strength;
-                        }
+                        /* Exact match priority - compute from candidate's actual properties */
+                        float node_strength = candidate->weight * 
+                                             (candidate->outgoing_count + candidate->incoming_count + 1);
+                        float exact_match_boost = node_strength;
                         priority_score += exact_match_boost;
                     } else {
                         /* Larger nodes get priority boost relative to how much larger they are */
                         float size_ratio = (float)pattern_size / (float)candidate->payload_size;
-                        float size_multiplier = 0.0f;
-                        if (stats && stats->histogram_count > 0) {
-                            size_multiplier = stats->p50;  /* Median */
-                        } else {
-                            /* Compute from candidate weight relative to pattern */
-                            size_multiplier = candidate->weight / (candidate->weight + 1.0f);
-                        }
+                        /* Compute from candidate weight relative to pattern */
+                        float size_multiplier = candidate->weight / (candidate->weight + 1.0f);
                         priority_score += size_multiplier * size_ratio;
                     }
                 }
                 
                 /* 2. Edge weight priority: Strong edges likely lead to relevant patterns (compounds: use learned structure) */
+                /* Compute from actual edge weight relative to local average */
+                float local_avg = node_get_local_outgoing_weight_avg(node);
                 float edge_weight_multiplier = 0.0f;
-                if (stats && stats->edge_weight_count > 0) {
-                    /* Use average of p25 and p75 as median estimate */
-                    float median_estimate = (stats->edge_weight_p25 + stats->edge_weight_p75) / 2.0f;
-                    edge_weight_multiplier = median_estimate / (median_estimate + 1.0f);
+                if (local_avg > 0.0f) {
+                    edge_weight_multiplier = local_avg / (local_avg + 1.0f);
                 } else {
-                    /* Compute from actual edge weight relative to local average */
-                    float local_avg = node_get_local_outgoing_weight_avg(node);
-                    if (local_avg > 0.0f) {
-                        edge_weight_multiplier = local_avg / (local_avg + 1.0f);
-                    } else {
-                        edge_weight_multiplier = edge->weight / (edge->weight + 1.0f);
-                    }
+                    edge_weight_multiplier = edge->weight / (edge->weight + 1.0f);
                 }
                 priority_score += edge->weight * edge_weight_multiplier;
                 
                 /* 3. Similarity edge priority: Check if this might be a similarity edge (compounds: use semantic connections) */
-                /* DATA-DRIVEN: Use 25th-75th percentile range from actual edge weights */
-                float lower_bound = (stats && stats->edge_weight_count > 0) ? 
-                                   stats->edge_weight_p25 : 0.0f;
-                float upper_bound = (stats && stats->edge_weight_count > 0) ? 
-                                   stats->edge_weight_p75 : 0.0f;
-                if (edge->weight > lower_bound && edge->weight < upper_bound) {  /* Data-driven range */
+                /* Use local edge weight range (50% to 150% of local average) */
+                float local_edge_avg = node_get_local_outgoing_weight_avg(node);
+                float lower_bound = (local_edge_avg > 0.0f) ? local_edge_avg * 0.5f : 0.0f;
+                float upper_bound = (local_edge_avg > 0.0f) ? local_edge_avg * 1.5f : FLT_MAX;
+                if (edge->weight > lower_bound && edge->weight < upper_bound) {  /* Local range */
                     float similarity_hint = edge_compute_pattern_similarity(node, candidate);
-                    /* Similarity threshold and boost - from stats or computed */
+                    /* Similarity threshold - compute from local context */
                     float similarity_threshold = 0.0f;
-                    float similarity_boost = 0.0f;
-                    if (stats && stats->similarity_count > 0) {
-                        /* Use p75 as threshold (available in stats) */
-                        similarity_threshold = stats->similarity_p75;
-                        similarity_boost = stats->similarity_p75 / (stats->similarity_p75 + 1.0f);
-                    } else {
-                        /* Compute from actual similarity values */
-                        float local_avg = node_get_local_outgoing_weight_avg(node);
-                        similarity_threshold = (local_avg > 0.0f) ? local_avg / (local_avg + 1.0f) : 0.0f;
-                        similarity_boost = 1.0f;  /* Full boost when no stats */
+                    float similarity_boost = 1.0f;
+                    if (local_edge_avg > 0.0f) {
+                        similarity_threshold = local_edge_avg / (local_edge_avg + 1.0f);
                     }
                     if (similarity_hint > similarity_threshold) {
                         priority_score += similarity_hint * similarity_boost;
@@ -2167,7 +1905,7 @@ static Node* wave_find_node_via_exploration(MelvinGraph *g, Node **seed_nodes, s
                 
                 /* Store candidate with priority score for sorted exploration */
                 if (priority_count >= priority_capacity) {
-                    priority_capacity = (priority_capacity == 0) ? 4 : priority_capacity * 2;
+                    priority_capacity = (priority_capacity == 0) ? 1 : priority_capacity * 2;  /* Minimal context: start at 1 */
                     priority_candidates = (Node**)realloc(priority_candidates, priority_capacity * sizeof(Node*));
                     priority_scores = (float*)realloc(priority_scores, priority_capacity * sizeof(float));
                     if (!priority_candidates || !priority_scores) {
@@ -2247,7 +1985,7 @@ static Node* wave_find_node_via_exploration(MelvinGraph *g, Node **seed_nodes, s
                 
                 /* Add to next wave front for continued exploration */
                 if (next_size >= next_capacity) {
-                    next_capacity = (next_capacity == 0) ? 4 : next_capacity * 2;
+                    next_capacity = (next_capacity == 0) ? 1 : next_capacity * 2;  /* Minimal context: start at 1 */
                     next_wave_front = (Node**)realloc(next_wave_front, next_capacity * sizeof(Node*));
                     if (!next_wave_front) {
                         if (priority_candidates) free(priority_candidates);
@@ -2314,21 +2052,10 @@ Node** wave_process_sequential_patterns(MelvinGraph *g, const uint8_t *data, siz
     size_t sequence_capacity = 0;
     Node *prev_node = NULL;  /* Track previous node to use local edges */
     
-    /* Collect currently activated nodes as seeds for wave exploration */
-    Node **seed_nodes = NULL;
-    size_t seed_count = 0;
-    size_t seed_capacity = 0;
-    for (size_t i = 0; i < g->node_count; i++) {
-        Node *node = g->nodes[i];
-        if (node && node->activation_strength > 0.0f) {
-            if (seed_count >= seed_capacity) {
-                seed_capacity = (seed_capacity == 0) ? 4 : seed_capacity * 2;
-                seed_nodes = (Node**)realloc(seed_nodes, seed_capacity * sizeof(Node*));
-                if (!seed_nodes) break;
-            }
-            seed_nodes[seed_count++] = node;
-        }
-    }
+    /* CONTEXT: Use last activated nodes as seeds for wave exploration (activation = context) */
+    /* Memory = weights (persistent), Context = activation (from previous input) */
+    /* This allows system to find existing nodes through activation context */
+    /* Follows README: compounding learning - previous activations guide finding nodes */
     
     /* Process input byte-by-byte to find sequential patterns */
     /* Each byte/pattern becomes a node, creating the sequence from data */
@@ -2339,44 +2066,26 @@ Node** wave_process_sequential_patterns(MelvinGraph *g, const uint8_t *data, siz
         /* This implements the vision: "Try larger patterns first (hierarchy-first matching)" */
         /* Start with largest possible patterns and work down to single bytes */
         
-            /* DATA-DRIVEN: Compute max pattern size from local context (no hardcoded limit) */
+        /* DATA-DRIVEN: Compute max pattern size from local context (no hardcoded limit) */
         size_t max_pattern_size = data_size - i;  /* Start with maximum possible (remaining data) */
-            
-            /* Adapt based on local node sizes: if nodes in this area are large, try larger patterns */
-            if (seed_count > 0) {
-                size_t total_payload_size = 0;
-                size_t nodes_with_payload = 0;
-            size_t max_local_payload = 0;
-                for (size_t k = 0; k < seed_count; k++) {
-                    if (seed_nodes[k] && seed_nodes[k]->payload_size > 0) {
-                        total_payload_size += seed_nodes[k]->payload_size;
-                        nodes_with_payload++;
-                    if (seed_nodes[k]->payload_size > max_local_payload) {
-                        max_local_payload = seed_nodes[k]->payload_size;
-                    }
-                    }
-                }
-                if (nodes_with_payload > 0) {
-                    size_t avg_payload_size = total_payload_size / nodes_with_payload;
-                /* Try patterns up to max of: average size, max local size, or remaining data */
-                /* Fully adaptive - no hardcoded defaults */
-                size_t adaptive_max = (max_local_payload > avg_payload_size) ? max_local_payload : avg_payload_size;
-                if (adaptive_max > 0 && adaptive_max < max_pattern_size) {
-                    max_pattern_size = adaptive_max;
-                }
-                }
+        
+        /* Adapt based on local node sizes: if previous nodes in sequence are large, try larger patterns */
+        /* Use prev_node for local context (no graph scan) - follows README: local operations only */
+        if (prev_node && prev_node->payload_size > 0) {
+            /* Use previous node's size as local context - O(1) local operation */
+            size_t max_local_payload = prev_node->payload_size;
+            /* If local nodes are large, suggest trying larger patterns */
+            /* RELATIVE: Adapt max_pattern_size relative to local context (no hardcoded multiplier) */
+            if (max_local_payload > 1 && max_local_payload < max_pattern_size) {
+                /* Try patterns up to the size of local large nodes */
+                max_pattern_size = max_local_payload;
             }
-            
-            /* Cap at remaining data size */
-            if (max_pattern_size > data_size - i) {
-                max_pattern_size = data_size - i;
-            }
-        // #region agent log
-        char log_data[256];
-        snprintf(log_data, sizeof(log_data), "{\"max_pattern_size\":%zu,\"data_remaining\":%zu,\"seed_count\":%zu}",
-                 max_pattern_size, data_size - i, seed_count);
-        debug_log("melvin.c:1623", "Hierarchy-first pattern size computed", log_data);
-        // #endregion agent log
+        }
+        
+        /* Cap at remaining data size */
+        if (max_pattern_size > data_size - i) {
+            max_pattern_size = data_size - i;
+        }
         
         /* HIERARCHY-FIRST: Try larger patterns first, then fall back to smaller */
         /* Start from max_pattern_size and work down to 1 */
@@ -2403,12 +2112,28 @@ Node** wave_process_sequential_patterns(MelvinGraph *g, const uint8_t *data, siz
                 }
             }
             
+            /* 2b. Check last activated nodes from previous input (activation context) */
+            /* This provides context when prev_node is NULL (first byte of input) */
+            if (!activated_node && g->last_activated_count > 0) {
+                for (size_t k = 0; k < g->last_activated_count; k++) {
+                    Node *ctx_node = g->last_activated[k];
+                    if (ctx_node && node_payload_exact_match(ctx_node, pattern, pattern_size)) {
+                        activated_node = ctx_node;
+                        break;
+                    }
+                }
+            }
+            
             /* 3. For larger patterns (>1 byte), use wave exploration to find hierarchy nodes */
-            if (!activated_node && pattern_size > 1) {
+            if (!activated_node && pattern_size > 1 && prev_node) {
                 /* UNIVERSAL: Use wave exploration to find nodes matching larger pattern */
                 /* Prioritizes nodes with payload_size >= pattern_size (all nodes, not just combined) */
-                Node *hierarchy_match = wave_find_node_via_exploration(g, seed_nodes, seed_count,
-                                                                        pattern, pattern_size, 2, NULL);
+                /* LOCAL: Use prev_node as seed for wave exploration (follows README: local operations only) */
+                /* ADAPTIVE: Exploration steps scale with graph size (logarithmic) - no hardcoded depth */
+                size_t adaptive_steps = compute_adaptive_exploration_steps(g, 1);
+                Node *seed_node = prev_node;
+                Node *hierarchy_match = wave_find_node_via_exploration(g, &seed_node, 1,
+                                                                        pattern, pattern_size, adaptive_steps, NULL);
                 if (hierarchy_match && hierarchy_match->payload_size >= pattern_size &&
                     node_payload_exact_match(hierarchy_match, pattern, pattern_size)) {
                     /* Found node matching larger pattern - use it (compounds: skip individual bytes) */
@@ -2431,14 +2156,18 @@ Node** wave_process_sequential_patterns(MelvinGraph *g, const uint8_t *data, siz
         const uint8_t *pattern = data + i;
         size_t pattern_size = 1;  /* Fall back to single byte if hierarchy-first didn't match */
         
-        /* 4. Use wave propagation to explore graph from activated seeds (whole graph context via edges) */
+        /* 4. Use wave propagation to explore graph from prev_node as seed (local operation, no graph scan) */
         /* This discovers existing nodes through natural graph exploration (exact or similar matches) */
         /* Compounding learning: blank nodes actively accept patterns, teaching the whole system */
         Node *found_match = NULL;
         bool is_exact_match = false;
-        if (!activated_node && seed_count > 0) {
-            found_match = wave_find_node_via_exploration(g, seed_nodes, seed_count, 
-                                                          pattern, pattern_size, 3, NULL);
+        if (!activated_node && prev_node) {
+            /* LOCAL: Use prev_node as single seed for wave exploration (follows README: local operations only) */
+            /* ADAPTIVE: Exploration steps scale with graph size (logarithmic) - no hardcoded depth */
+            size_t adaptive_steps = compute_adaptive_exploration_steps(g, 1);
+            Node *seed_node = prev_node;
+            found_match = wave_find_node_via_exploration(g, &seed_node, 1, 
+                                                          pattern, pattern_size, adaptive_steps, NULL);
             if (found_match) {
                 /* Use exact match if found */
                 is_exact_match = node_payload_exact_match(found_match, pattern, pattern_size);
@@ -2457,10 +2186,12 @@ Node** wave_process_sequential_patterns(MelvinGraph *g, const uint8_t *data, siz
         /* Blank nodes are active learning slots - every pattern can teach existing blank nodes */
         /* This compounds knowledge: each pattern connecting to a blank teaches it about its category */
         /* Enhanced: Uses similarity/context edges to find blanks more efficiently */
-        if (!activated_node && seed_count > 0) {
+        /* LOCAL: Use prev_node as seed for blank node exploration (local operation, no graph scan) */
+        if (!activated_node && prev_node) {
             /* Compute adaptive exploration steps based on graph size and context (relative adaptive stability) */
-            size_t adaptive_steps = compute_adaptive_exploration_steps(g, seed_count);
-            Node *accepting_blank = wave_find_accepting_blank_node(g, seed_nodes, seed_count,
+            size_t adaptive_steps = compute_adaptive_exploration_steps(g, 1);  /* Single seed node */
+            Node *seed_node = prev_node;
+            Node *accepting_blank = wave_find_accepting_blank_node(g, &seed_node, 1,
                                                                     pattern, pattern_size, adaptive_steps);
             if (accepting_blank) {
                 /* Compute how well blank accepts this pattern */
@@ -2477,23 +2208,42 @@ Node** wave_process_sequential_patterns(MelvinGraph *g, const uint8_t *data, siz
                     filled_node = node_fill_blank(accepting_blank, pattern, pattern_size, acceptance_strength);
                     if (filled_node && graph_add_node(g, filled_node)) {
                         /* Transfer edges from blank to filled node to preserve connectivity */
+                        /* LEARN FROM EXISTING: Check if edges already exist before creating */
                         for (size_t i = 0; i < accepting_blank->incoming_count; i++) {
                             Edge *old_edge = accepting_blank->incoming_edges[i];
                             if (old_edge && old_edge->from_node) {
-                                Edge *new_edge = edge_create(old_edge->from_node, filled_node, true);
-                                if (new_edge) {
-                                    new_edge->weight = old_edge->weight;
-                                    graph_add_edge(g, new_edge, old_edge->from_node, filled_node);
+                                Edge *existing = node_find_edge_to(old_edge->from_node, filled_node);
+                                if (existing) {
+                                    /* Edge already exists - strengthen it (learning through repetition) */
+                                    existing->activation = true;
+                                    edge_update_weight_local(existing);
+                                } else {
+                                    /* Create new edge */
+                                    Edge *new_edge = edge_create(old_edge->from_node, filled_node, true);
+                                    if (new_edge) {
+                                        new_edge->weight = compute_relative_initial_edge_weight(old_edge->from_node, old_edge->weight);
+                                        new_edge->activation = true;
+                                        graph_add_edge(g, new_edge, old_edge->from_node, filled_node);
+                                    }
                                 }
                             }
                         }
                         for (size_t i = 0; i < accepting_blank->outgoing_count; i++) {
                             Edge *old_edge = accepting_blank->outgoing_edges[i];
                             if (old_edge && old_edge->to_node) {
-                                Edge *new_edge = edge_create(filled_node, old_edge->to_node, true);
-                                if (new_edge) {
-                                    new_edge->weight = old_edge->weight;
-                                    graph_add_edge(g, new_edge, filled_node, old_edge->to_node);
+                                Edge *existing = node_find_edge_to(filled_node, old_edge->to_node);
+                                if (existing) {
+                                    /* Edge already exists - strengthen it (learning through repetition) */
+                                    existing->activation = true;
+                                    edge_update_weight_local(existing);
+                                } else {
+                                    /* Create new edge */
+                                    Edge *new_edge = edge_create(filled_node, old_edge->to_node, true);
+                                    if (new_edge) {
+                                        new_edge->weight = compute_relative_initial_edge_weight(filled_node, old_edge->weight);
+                                        new_edge->activation = true;
+                                        graph_add_edge(g, new_edge, filled_node, old_edge->to_node);
+                                    }
                                 }
                             }
                         }
@@ -2508,15 +2258,59 @@ Node** wave_process_sequential_patterns(MelvinGraph *g, const uint8_t *data, siz
                     Node *new_pattern_node = node_create(pattern, pattern_size);
                     if (new_pattern_node && graph_add_node(g, new_pattern_node)) {
                         /* Connect new pattern to blank node (bidirectional - blank learns from pattern) */
-                        Edge *edge1 = edge_create(new_pattern_node, accepting_blank, true);
-                        Edge *edge2 = edge_create(accepting_blank, new_pattern_node, true);
-                        if (edge1) {
-                            edge1->weight = acceptance_strength;
-                            graph_add_edge(g, edge1, new_pattern_node, accepting_blank);
-                        }
-                        if (edge2) {
-                            edge2->weight = acceptance_strength;
-                            graph_add_edge(g, edge2, accepting_blank, new_pattern_node);
+                        /* LEARN FROM EXISTING: Check if edges already exist (from similarity/context/co-activation) */
+                        Edge *existing1 = node_find_edge_to(new_pattern_node, accepting_blank);
+                        Edge *existing2 = node_find_edge_to(accepting_blank, new_pattern_node);
+                        
+                        if (existing1 && existing2) {
+                            /* Both edges exist - strengthen them (learning through repetition) */
+                            existing1->activation = true;
+                            existing2->activation = true;
+                            edge_update_weight_local(existing1);
+                            edge_update_weight_local(existing2);
+                        } else {
+                            /* Create missing edges */
+                            Edge *edge1 = NULL;
+                            Edge *edge2 = NULL;
+                            
+                            if (!existing1) {
+                                edge1 = edge_create(new_pattern_node, accepting_blank, true);
+                            }
+                            if (!existing2) {
+                                edge2 = edge_create(accepting_blank, new_pattern_node, true);
+                            }
+                            
+                            if (edge1 && edge2) {
+                                /* Both new - use acceptance strength as initial weight */
+                                edge1->weight = compute_relative_initial_edge_weight(new_pattern_node, acceptance_strength);
+                                edge2->weight = compute_relative_initial_edge_weight(accepting_blank, acceptance_strength);
+                                edge1->activation = true;
+                                edge2->activation = true;
+                                graph_add_edge(g, edge1, new_pattern_node, accepting_blank);
+                                graph_add_edge(g, edge2, accepting_blank, new_pattern_node);
+                            } else if (edge1) {
+                                edge1->weight = compute_relative_initial_edge_weight(new_pattern_node, acceptance_strength);
+                                edge1->activation = true;
+                                graph_add_edge(g, edge1, new_pattern_node, accepting_blank);
+                            } else if (edge2) {
+                                edge2->weight = compute_relative_initial_edge_weight(accepting_blank, acceptance_strength);
+                                edge2->activation = true;
+                                graph_add_edge(g, edge2, accepting_blank, new_pattern_node);
+                            } else {
+                                /* Both exist - should have been handled above */
+                                if (edge1) edge_free(edge1);
+                                if (edge2) edge_free(edge2);
+                            }
+                            
+                            /* Strengthen existing edges if they exist */
+                            if (existing1) {
+                                existing1->activation = true;
+                                edge_update_weight_local(existing1);
+                            }
+                            if (existing2) {
+                                existing2->activation = true;
+                                edge_update_weight_local(existing2);
+                            }
                         }
                         
                         activated_node = new_pattern_node;  /* Use the new pattern node */
@@ -2553,15 +2347,57 @@ Node** wave_process_sequential_patterns(MelvinGraph *g, const uint8_t *data, siz
                     blank_bridge->weight = (found_match->weight + match_strength) / 2.0f;
                     
                     /* Connect blank to similar pattern */
-                    Edge *edge1 = edge_create(blank_bridge, found_match, true);
-                    Edge *edge2 = edge_create(found_match, blank_bridge, true);
-                    if (edge1) {
-                        edge1->weight = match_strength;
-                        graph_add_edge(g, edge1, blank_bridge, found_match);
-                    }
-                    if (edge2) {
-                        edge2->weight = match_strength;
-                        graph_add_edge(g, edge2, found_match, blank_bridge);
+                    /* LEARN FROM EXISTING: Check if edges already exist (from similarity/context/co-activation) */
+                    Edge *existing1 = node_find_edge_to(blank_bridge, found_match);
+                    Edge *existing2 = node_find_edge_to(found_match, blank_bridge);
+                    
+                    if (existing1 && existing2) {
+                        /* Both edges exist - strengthen them (learning through repetition) */
+                        existing1->activation = true;
+                        existing2->activation = true;
+                        edge_update_weight_local(existing1);
+                        edge_update_weight_local(existing2);
+                    } else {
+                        /* Create missing edges */
+                        Edge *edge1 = NULL;
+                        Edge *edge2 = NULL;
+                        
+                        if (!existing1) {
+                            edge1 = edge_create(blank_bridge, found_match, true);
+                        }
+                        if (!existing2) {
+                            edge2 = edge_create(found_match, blank_bridge, true);
+                        }
+                        
+                        if (edge1 && edge2) {
+                            edge1->weight = compute_relative_initial_edge_weight(blank_bridge, match_strength);
+                            edge2->weight = compute_relative_initial_edge_weight(found_match, match_strength);
+                            edge1->activation = true;
+                            edge2->activation = true;
+                            graph_add_edge(g, edge1, blank_bridge, found_match);
+                            graph_add_edge(g, edge2, found_match, blank_bridge);
+                        } else if (edge1) {
+                            edge1->weight = compute_relative_initial_edge_weight(blank_bridge, match_strength);
+                            edge1->activation = true;
+                            graph_add_edge(g, edge1, blank_bridge, found_match);
+                        } else if (edge2) {
+                            edge2->weight = compute_relative_initial_edge_weight(found_match, match_strength);
+                            edge2->activation = true;
+                            graph_add_edge(g, edge2, found_match, blank_bridge);
+                        } else {
+                            if (edge1) edge_free(edge1);
+                            if (edge2) edge_free(edge2);
+                        }
+                        
+                        /* Strengthen existing edges if they exist */
+                        if (existing1) {
+                            existing1->activation = true;
+                            edge_update_weight_local(existing1);
+                        }
+                        if (existing2) {
+                            existing2->activation = true;
+                            edge_update_weight_local(existing2);
+                        }
                     }
                 } else {
                     if (blank_bridge) node_free(blank_bridge);
@@ -2573,18 +2409,60 @@ Node** wave_process_sequential_patterns(MelvinGraph *g, const uint8_t *data, siz
             Node *new_pattern_node = node_create(pattern, pattern_size);
             if (new_pattern_node && graph_add_node(g, new_pattern_node)) {
                 /* Connect new pattern to blank bridge */
-                Edge *edge1 = edge_create(new_pattern_node, blank_bridge, true);
-                Edge *edge2 = edge_create(blank_bridge, new_pattern_node, true);
-                if (edge1) {
-                    float match_strength = node_calculate_match_strength(found_match, pattern, pattern_size);
-                    edge1->weight = match_strength;
-                    graph_add_edge(g, edge1, new_pattern_node, blank_bridge);
+                /* LEARN FROM EXISTING: Check if edges already exist (from similarity/context/co-activation) */
+                float match_strength = node_calculate_match_strength(found_match, pattern, pattern_size);
+                Edge *existing1 = node_find_edge_to(new_pattern_node, blank_bridge);
+                Edge *existing2 = node_find_edge_to(blank_bridge, new_pattern_node);
+                
+                if (existing1 && existing2) {
+                    /* Both edges exist - strengthen them (learning through repetition) */
+                    existing1->activation = true;
+                    existing2->activation = true;
+                    edge_update_weight_local(existing1);
+                    edge_update_weight_local(existing2);
+                } else {
+                    /* Create missing edges */
+                    Edge *edge1 = NULL;
+                    Edge *edge2 = NULL;
+                    
+                    if (!existing1) {
+                        edge1 = edge_create(new_pattern_node, blank_bridge, true);
+                    }
+                    if (!existing2) {
+                        edge2 = edge_create(blank_bridge, new_pattern_node, true);
+                    }
+                    
+                    if (edge1 && edge2) {
+                        edge1->weight = compute_relative_initial_edge_weight(new_pattern_node, match_strength);
+                        edge2->weight = compute_relative_initial_edge_weight(blank_bridge, match_strength);
+                        edge1->activation = true;
+                        edge2->activation = true;
+                        graph_add_edge(g, edge1, new_pattern_node, blank_bridge);
+                        graph_add_edge(g, edge2, blank_bridge, new_pattern_node);
+                    } else if (edge1) {
+                        edge1->weight = compute_relative_initial_edge_weight(new_pattern_node, match_strength);
+                        edge1->activation = true;
+                        graph_add_edge(g, edge1, new_pattern_node, blank_bridge);
+                    } else if (edge2) {
+                        edge2->weight = compute_relative_initial_edge_weight(blank_bridge, match_strength);
+                        edge2->activation = true;
+                        graph_add_edge(g, edge2, blank_bridge, new_pattern_node);
+                    } else {
+                        if (edge1) edge_free(edge1);
+                        if (edge2) edge_free(edge2);
+                    }
+                    
+                    /* Strengthen existing edges if they exist */
+                    if (existing1) {
+                        existing1->activation = true;
+                        edge_update_weight_local(existing1);
+                    }
+                    if (existing2) {
+                        existing2->activation = true;
+                        edge_update_weight_local(existing2);
+                    }
                 }
-                if (edge2) {
-                    float match_strength = node_calculate_match_strength(found_match, pattern, pattern_size);
-                    edge2->weight = match_strength;
-                    graph_add_edge(g, edge2, blank_bridge, new_pattern_node);
-                }
+                
                 activated_node = new_pattern_node;
             } else {
                 if (new_pattern_node) node_free(new_pattern_node);
@@ -2617,7 +2495,7 @@ Node** wave_process_sequential_patterns(MelvinGraph *g, const uint8_t *data, siz
             /* Sequence represents the actual input pattern, allowing repeated nodes */
             /* This enables patterns like "hello" where 'l' appears twice */
             if (sequence_count >= sequence_capacity) {
-                sequence_capacity = (sequence_capacity == 0) ? 4 : sequence_capacity * 2;
+                sequence_capacity = (sequence_capacity == 0) ? 1 : sequence_capacity * 2;  /* Minimal context: start at 1 */
                 sequence = (Node**)realloc(sequence, (sequence_capacity + 1) * sizeof(Node*));
                 if (!sequence) {
                     *out_count = 0;
@@ -2634,7 +2512,25 @@ Node** wave_process_sequential_patterns(MelvinGraph *g, const uint8_t *data, siz
         sequence[sequence_count] = NULL;
     }
     
-    if (seed_nodes) free(seed_nodes);
+    /* Update graph context: save current sequence as last_activated for next input */
+    /* Memory = weights (persistent), Context = activation (current sequence becomes next context) */
+    if (sequence_count > 0) {
+        /* Resize if needed */
+        if (sequence_count > g->last_activated_capacity) {
+            size_t new_capacity = sequence_count * 2;
+            Node **new_activated = (Node**)realloc(g->last_activated, new_capacity * sizeof(Node*));
+            if (new_activated) {
+                g->last_activated = new_activated;
+                g->last_activated_capacity = new_capacity;
+            }
+        }
+        
+        /* Copy sequence to last_activated (activation context for next input) */
+        if (sequence_count <= g->last_activated_capacity) {
+            memcpy(g->last_activated, sequence, sequence_count * sizeof(Node*));
+            g->last_activated_count = sequence_count;
+        }
+    }
     
     *out_count = sequence_count;
     return sequence;
@@ -2648,7 +2544,7 @@ void wave_create_edges_from_similarity(MelvinGraph *g, Node *node, float similar
     /* Use wave propagation to find similar patterns (local-only exploration) */
     Node **seed_nodes = NULL;
     size_t seed_count = 0;
-    size_t seed_capacity = 4;
+    size_t seed_capacity = 1;  /* Minimal context: absolute minimum, grows immediately when data arrives */
     
     seed_nodes = (Node**)malloc(seed_capacity * sizeof(Node*));
     if (!seed_nodes) return;
@@ -2662,8 +2558,31 @@ void wave_create_edges_from_similarity(MelvinGraph *g, Node *node, float similar
     
     if (!similar || similar == node) return;
     
-    /* Check if edge already exists */
-    if (node_find_edge_to(node, similar)) return;
+    /* Check if edges already exist (check both directions for bidirectional edges) */
+    Edge *existing1 = node_find_edge_to(node, similar);
+    Edge *existing2 = node_find_edge_to(similar, node);
+    
+    /* If edges exist, strengthen them (compounding learning) */
+    if (existing1 && existing2) {
+        /* Both directions exist - strengthen both */
+        existing1->activation = true;
+        existing2->activation = true;
+        edge_update_weight_local(existing1);
+        edge_update_weight_local(existing2);
+        return;
+    } else if (existing1 || existing2) {
+        /* One direction exists - strengthen it, but we still need to create the other */
+        /* This handles asymmetric edge cases */
+        if (existing1) {
+            existing1->activation = true;
+            edge_update_weight_local(existing1);
+        }
+        if (existing2) {
+            existing2->activation = true;
+            edge_update_weight_local(existing2);
+        }
+        /* Continue to create missing direction if similarity threshold is met */
+    }
     
     /* Compute similarity score */
     float similarity = edge_compute_pattern_similarity(node, similar);
@@ -2695,19 +2614,42 @@ void wave_create_edges_from_similarity(MelvinGraph *g, Node *node, float similar
     }
     
     if (similarity >= relative_threshold) {
-        /* Create bidirectional edge for similar patterns */
-        Edge *edge1 = edge_create(node, similar, true);
-        Edge *edge2 = edge_create(similar, node, true);
+        /* Create bidirectional edge for similar patterns (only if doesn't already exist) */
+        Edge *edge1 = NULL;
+        Edge *edge2 = NULL;
+        
+        if (!existing1) {
+            edge1 = edge_create(node, similar, true);
+        }
+        if (!existing2) {
+            edge2 = edge_create(similar, node, true);
+        }
         
         if (edge1 && edge2) {
-            /* UNIVERSAL: Weight relative to local context (no hardcoded multiplier) */
-            float context_weight = (local_avg > 0.0f) ? similarity * (local_avg / (local_avg + 1.0f)) : similarity;
-            edge1->weight = context_weight;
-            edge2->weight = context_weight;
+            /* RELATIVE: Initial weight relative to local context (no hardcoded multiplier) */
+            float initial_weight1 = compute_relative_initial_edge_weight(node, similarity);
+            float initial_weight2 = compute_relative_initial_edge_weight(similar, similarity);
+            edge1->weight = initial_weight1;
+            edge2->weight = initial_weight2;
+            edge1->activation = true;
+            edge2->activation = true;
             
             graph_add_edge(g, edge1, node, similar);
             graph_add_edge(g, edge2, similar, node);
+        } else if (edge1) {
+            /* Only edge1 needs to be created */
+            float initial_weight1 = compute_relative_initial_edge_weight(node, similarity);
+            edge1->weight = initial_weight1;
+            edge1->activation = true;
+            graph_add_edge(g, edge1, node, similar);
+        } else if (edge2) {
+            /* Only edge2 needs to be created */
+            float initial_weight2 = compute_relative_initial_edge_weight(similar, similarity);
+            edge2->weight = initial_weight2;
+            edge2->activation = true;
+            graph_add_edge(g, edge2, similar, node);
         } else {
+            /* Both already exist - should have been handled above, but free if somehow created */
             if (edge1) edge_free(edge1);
             if (edge2) edge_free(edge2);
         }
@@ -2721,18 +2663,51 @@ void wave_create_edges_from_context(MelvinGraph *g, Node **recently_activated, s
     if (!g || !recently_activated || count < 2) return;
     if (!context_visited) return;
     
-    /* Check pairs of recently activated nodes for context similarity */
+    /* Limit to avoid O(n²) complexity - adaptive limit based on data size */
+    /* Use sqrt(n) for O(√n) complexity - follows README: efficient local operations */
+    /* Sample approximately √n nodes and check pairs only among sampled nodes */
+    size_t sample_size = compute_adaptive_sample_limit(count, 2, count);
+    size_t pair_count = 0;
+    size_t max_pairs = sample_size * (sample_size - 1) / 2;  /* Pairs among sampled nodes */
+    
+    /* Check pairs of recently activated nodes for context similarity (sampled pairs) */
     /* Context = nodes that wave propagation has explored (paths recently traveled) */
-    for (size_t i = 0; i < count - 1; i++) {
+    for (size_t i = 0; i < count - 1 && i < sample_size; i++) {
         Node *node1 = recently_activated[i];
         if (!node1) continue;
+        if (pair_count >= max_pairs) break;  /* Stop when we've checked enough pairs */
         
-        for (size_t j = i + 1; j < count; j++) {
+        for (size_t j = i + 1; j < count && j < sample_size; j++) {
+            pair_count++;
+            if (pair_count > max_pairs) break;  /* Stop if we exceed limit */
             Node *node2 = recently_activated[j];
             if (!node2 || node1 == node2) continue;
             
-            /* Skip if edge already exists */
-            if (node_find_edge_to(node1, node2)) continue;
+            /* Check if edges already exist (check both directions for bidirectional edges) */
+            Edge *existing1 = node_find_edge_to(node1, node2);
+            Edge *existing2 = node_find_edge_to(node2, node1);
+            
+            /* If edges exist, strengthen them (compounding learning) */
+            if (existing1 && existing2) {
+                /* Both directions exist - strengthen both */
+                existing1->activation = true;
+                existing2->activation = true;
+                edge_update_weight_local(existing1);
+                edge_update_weight_local(existing2);
+                continue;
+            } else if (existing1 || existing2) {
+                /* One direction exists - strengthen it, but we still need to create the other */
+                /* This handles asymmetric edge cases */
+                if (existing1) {
+                    existing1->activation = true;
+                    edge_update_weight_local(existing1);
+                }
+                if (existing2) {
+                    existing2->activation = true;
+                    edge_update_weight_local(existing2);
+                }
+                /* Continue to create missing direction if context threshold is met */
+            }
             
             /* Compute context similarity based on wave propagation exploration */
             /* Context = nodes visited by wave propagation (paths recently traveled) */
@@ -2750,21 +2725,42 @@ void wave_create_edges_from_context(MelvinGraph *g, Node **recently_activated, s
             float context_threshold = (avg_local > 0.0f) ? avg_local / (avg_local + 1.0f) : 0.0f;
             
             if (context_similarity >= context_threshold) {
-                /* Create bidirectional edge based on context */
-                Edge *edge1 = edge_create(node1, node2, true);
-                Edge *edge2 = edge_create(node2, node1, true);
+                /* Create bidirectional edge based on context (only if doesn't already exist) */
+                Edge *edge1 = NULL;
+                Edge *edge2 = NULL;
+                
+                if (!existing1) {
+                    edge1 = edge_create(node1, node2, true);
+                }
+                if (!existing2) {
+                    edge2 = edge_create(node2, node1, true);
+                }
                 
                 if (edge1 && edge2) {
-                    /* UNIVERSAL: Weight relative to local context (no hardcoded multiplier) */
-                    float context_weight = (avg_local > 0.0f) ? 
-                                          context_similarity * (avg_local / (avg_local + 1.0f)) : 
-                                          context_similarity;
-                    edge1->weight = context_weight;
-                    edge2->weight = context_weight;
+                    /* RELATIVE: Initial weight relative to local context (no hardcoded multiplier) */
+                    float initial_weight1 = compute_relative_initial_edge_weight(node1, context_similarity);
+                    float initial_weight2 = compute_relative_initial_edge_weight(node2, context_similarity);
+                    edge1->weight = initial_weight1;
+                    edge2->weight = initial_weight2;
+                    edge1->activation = true;
+                    edge2->activation = true;
                     
                     graph_add_edge(g, edge1, node1, node2);
                     graph_add_edge(g, edge2, node2, node1);
+                } else if (edge1) {
+                    /* Only edge1 needs to be created */
+                    float initial_weight1 = compute_relative_initial_edge_weight(node1, context_similarity);
+                    edge1->weight = initial_weight1;
+                    edge1->activation = true;
+                    graph_add_edge(g, edge1, node1, node2);
+                } else if (edge2) {
+                    /* Only edge2 needs to be created */
+                    float initial_weight2 = compute_relative_initial_edge_weight(node2, context_similarity);
+                    edge2->weight = initial_weight2;
+                    edge2->activation = true;
+                    graph_add_edge(g, edge2, node2, node1);
                 } else {
+                    /* Both already exist - should have been handled above, but free if somehow created */
                     if (edge1) edge_free(edge1);
                     if (edge2) edge_free(edge2);
                 }
@@ -2784,9 +2780,19 @@ void wave_create_edges_from_context(MelvinGraph *g, Node **recently_activated, s
 void wave_form_universal_generalizations(MelvinGraph *g, Node **co_activated, size_t count) {
     if (!g || !co_activated || count < 2) return;
     
-    /* Find groups of similar nodes */
-    for (size_t i = 0; i < count - 1; i++) {
-        for (size_t j = i + 1; j < count; j++) {
+    /* Limit to avoid O(n²) complexity - adaptive limit based on data size */
+    /* Use sqrt(n) for O(√n) complexity - follows README: efficient local operations */
+    /* Sample approximately √n nodes and check pairs only among sampled nodes */
+    size_t sample_size = compute_adaptive_sample_limit(count, 2, count);
+    size_t pair_count = 0;
+    size_t max_pairs = sample_size * (sample_size - 1) / 2;  /* Pairs among sampled nodes */
+    
+    /* Find groups of similar nodes (sampled pairs, not all combinations) */
+    for (size_t i = 0; i < count - 1 && i < sample_size; i++) {
+        if (pair_count >= max_pairs) break;  /* Stop when we've checked enough pairs */
+        for (size_t j = i + 1; j < count && j < sample_size; j++) {
+            pair_count++;
+            if (pair_count > max_pairs) break;  /* Stop if we exceed limit */
             Node *node1 = co_activated[i];
             Node *node2 = co_activated[j];
             
@@ -2810,18 +2816,42 @@ void wave_form_universal_generalizations(MelvinGraph *g, Node **co_activated, si
             if ((min_similarity == 0.0f || similarity >= min_similarity) && 
                 (max_similarity == 1.0f || similarity <= max_similarity)) {
                 
-                /* Check if generalization node already exists */
+                /* LOCAL OPERATION: Check if generalization node already exists through local connections */
+                /* Check through node1's and node2's edges (no graph scan) - follows README: local operations only */
+                /* A generalization node that connects to both node1 and node2 would be found via their edges */
                 bool generalization_exists = false;
-                for (size_t k = 0; k < g->node_count; k++) {
-                    Node *gen = g->nodes[k];
-                    if (!gen) continue;
+                
+                /* Check node1's connections for blank nodes that also connect to node2 */
+                for (size_t k = 0; k < node1->outgoing_count && !generalization_exists; k++) {
+                    Edge *edge1 = node1->outgoing_edges[k];
+                    if (!edge1 || !edge1->to_node) continue;
+                    Node *candidate = edge1->to_node;
                     
-                    /* Check if gen connects to both similar nodes */
-                    bool connected_to_both = (node_find_edge_to(gen, node1) && 
-                                             node_find_edge_to(gen, node2));
-                    if (connected_to_both) {
-                        generalization_exists = true;
-                        break;
+                    /* Check if candidate is a blank node (generalization nodes are blank) */
+                    if (candidate->payload_size == 0) {
+                        /* Check if this blank also connects to node2 (local check through node2's edges) */
+                        if (node_find_edge_to(node2, candidate) || node_find_edge_to(candidate, node2)) {
+                            generalization_exists = true;
+                            break;
+                        }
+                    }
+                }
+                
+                /* Also check node1's incoming edges (bidirectional connections) */
+                if (!generalization_exists) {
+                    for (size_t k = 0; k < node1->incoming_count; k++) {
+                        Edge *edge1 = node1->incoming_edges[k];
+                        if (!edge1 || !edge1->from_node) continue;
+                        Node *candidate = edge1->from_node;
+                        
+                        /* Check if candidate is a blank node (generalization nodes are blank) */
+                        if (candidate->payload_size == 0) {
+                            /* Check if this blank also connects to node2 (local check through node2's edges) */
+                            if (node_find_edge_to(node2, candidate) || node_find_edge_to(candidate, node2)) {
+                                generalization_exists = true;
+                                break;
+                            }
+                        }
                     }
                 }
                 
@@ -2830,39 +2860,82 @@ void wave_form_universal_generalizations(MelvinGraph *g, Node **co_activated, si
                     Node *generalization = node_create_blank();  /* No payload = abstract representation */
                     if (generalization && graph_add_node(g, generalization)) {
                         /* Connect to both similar nodes */
-                        Edge *e1 = edge_create(node1, generalization, true);
-                        Edge *e2 = edge_create(generalization, node1, true);
-                        Edge *e3 = edge_create(node2, generalization, true);
-                        Edge *e4 = edge_create(generalization, node2, true);
+                        /* LEARN FROM EXISTING: Check if edges already exist before creating */
+                        Edge *e1_existing = node_find_edge_to(node1, generalization);
+                        Edge *e2_existing = node_find_edge_to(generalization, node1);
+                        Edge *e3_existing = node_find_edge_to(node2, generalization);
+                        Edge *e4_existing = node_find_edge_to(generalization, node2);
+                        
+                        Edge *e1 = NULL, *e2 = NULL, *e3 = NULL, *e4 = NULL;
+                        if (!e1_existing) e1 = edge_create(node1, generalization, true);
+                        if (!e2_existing) e2 = edge_create(generalization, node1, true);
+                        if (!e3_existing) e3 = edge_create(node2, generalization, true);
+                        if (!e4_existing) e4 = edge_create(generalization, node2, true);
                         
                         if (e1 && e2 && e3 && e4) {
-                            /* UNIVERSAL: Weight relative to similarity and local context */
-                            float gen_weight = (avg_context > 0.0f) ? 
-                                              similarity * (avg_context / (avg_context + 1.0f)) : 
-                                              similarity;
-                            e1->weight = gen_weight;
-                            e2->weight = gen_weight;
-                            e3->weight = gen_weight;
-                            e4->weight = gen_weight;
+                            /* All new - create all */
+                            float gen_weight1 = compute_relative_initial_edge_weight(node1, similarity);
+                            float gen_weight2 = compute_relative_initial_edge_weight(generalization, similarity);
+                            float gen_weight3 = compute_relative_initial_edge_weight(node2, similarity);
+                            float gen_weight4 = compute_relative_initial_edge_weight(generalization, similarity);
+                            e1->weight = gen_weight1;
+                            e2->weight = gen_weight2;
+                            e3->weight = gen_weight3;
+                            e4->weight = gen_weight4;
+                            e1->activation = true;
+                            e2->activation = true;
+                            e3->activation = true;
+                            e4->activation = true;
                             graph_add_edge(g, e1, node1, generalization);
                             graph_add_edge(g, e2, generalization, node1);
                             graph_add_edge(g, e3, node2, generalization);
                             graph_add_edge(g, e4, generalization, node2);
                         } else {
-                            if (e1) edge_free(e1);
-                            if (e2) edge_free(e2);
-                            if (e3) edge_free(e3);
-                            if (e4) edge_free(e4);
-                            /* Remove generalization node if edges failed */
-                            if (generalization) {
-                                for (size_t k = 0; k < g->node_count; k++) {
-                                    if (g->nodes[k] == generalization) {
-                                        g->nodes[k] = g->nodes[g->node_count - 1];
-                                        g->node_count--;
-                                        break;
-                                    }
+                            /* Some exist, create missing ones and strengthen existing */
+                            if (e1) {
+                                e1->weight = compute_relative_initial_edge_weight(node1, similarity);
+                                e1->activation = true;
+                                graph_add_edge(g, e1, node1, generalization);
+                            }
+                            if (e2) {
+                                e2->weight = compute_relative_initial_edge_weight(generalization, similarity);
+                                e2->activation = true;
+                                graph_add_edge(g, e2, generalization, node1);
+                            }
+                            if (e3) {
+                                e3->weight = compute_relative_initial_edge_weight(node2, similarity);
+                                e3->activation = true;
+                                graph_add_edge(g, e3, node2, generalization);
+                            }
+                            if (e4) {
+                                e4->weight = compute_relative_initial_edge_weight(generalization, similarity);
+                                e4->activation = true;
+                                graph_add_edge(g, e4, generalization, node2);
+                            }
+                            
+                            /* Strengthen existing edges */
+                            if (e1_existing) {
+                                e1_existing->activation = true;
+                                edge_update_weight_local(e1_existing);
+                            }
+                            if (e2_existing) {
+                                e2_existing->activation = true;
+                                edge_update_weight_local(e2_existing);
+                            }
+                            if (e3_existing) {
+                                e3_existing->activation = true;
+                                edge_update_weight_local(e3_existing);
+                            }
+                            if (e4_existing) {
+                                e4_existing->activation = true;
+                                edge_update_weight_local(e4_existing);
+                            }
+                            
+                            /* Free any unused edges */
+                            if (!e1 && !e2 && !e3 && !e4) {
+                                if (generalization) {
+                                    node_free(generalization);
                                 }
-                                node_free(generalization);
                             }
                         }
                     }
@@ -2879,9 +2952,19 @@ void wave_form_universal_generalizations(MelvinGraph *g, Node **co_activated, si
 void wave_form_universal_combinations(MelvinGraph *g, Node **co_activated, size_t count) {
     if (!g || !co_activated || count < 2) return;
     
-    /* Check all pairs of co-activated nodes */
-    for (size_t i = 0; i < count - 1; i++) {
-        for (size_t j = i + 1; j < count; j++) {
+    /* Limit to avoid O(n²) complexity - adaptive limit based on data size */
+    /* Use sqrt(n) for O(√n) complexity - follows README: efficient local operations */
+    /* Sample approximately √n nodes and check pairs only among sampled nodes */
+    size_t sample_size = compute_adaptive_sample_limit(count, 2, count);
+    size_t pair_count = 0;
+    size_t max_pairs = sample_size * (sample_size - 1) / 2;  /* Pairs among sampled nodes */
+    
+    /* Check pairs of co-activated nodes (sampled pairs, not all combinations) */
+    for (size_t i = 0; i < count - 1 && i < sample_size; i++) {
+        if (pair_count >= max_pairs) break;  /* Stop when we've checked enough pairs */
+        for (size_t j = i + 1; j < count && j < sample_size; j++) {
+            pair_count++;
+            if (pair_count > max_pairs) break;  /* Stop if we exceed limit */
             Node *node1 = co_activated[i];
             Node *node2 = co_activated[j];
             
@@ -3001,7 +3084,17 @@ void wave_create_homeostatic_edges(MelvinGraph *g, Node *isolated_node) {
                 if (well_connected_total > well_connected_threshold && !node_find_edge_to(isolated_node, well_connected)) {
                     Edge *homeostatic_edge = edge_create(isolated_node, well_connected, true);
                     if (homeostatic_edge) {
-                        homeostatic_edge->weight = 0.05f;  /* Very weak initial weight */
+                        /* RELATIVE: Very weak initial weight relative to local context (no hardcoded value) */
+                        /* Homeostatic edges should be weak - compute relative to local avg, then scale down */
+                        float local_avg = node_get_local_outgoing_weight_avg(isolated_node);
+                        if (local_avg > 0.0f) {
+                            /* Use a very small fraction of local average for weak connection */
+                            homeostatic_edge->weight = local_avg / (local_avg + 100.0f);  /* Very weak relative to context */
+                        } else {
+                            /* No local context: use minimal bootstrap relative to node weight */
+                            float node_weight = (isolated_node->weight > 0.0f) ? isolated_node->weight : 1.0f;
+                            homeostatic_edge->weight = node_weight / (node_weight + 100.0f);  /* Very weak */
+                        }
                         graph_add_edge(g, homeostatic_edge, isolated_node, well_connected);
                         connections_created++;
                     }
@@ -3015,6 +3108,7 @@ void wave_create_homeostatic_edges(MelvinGraph *g, Node *isolated_node) {
 /* Philosophy: Multiple mechanisms create rich graph structure */
 void wave_form_intelligent_edges(MelvinGraph *g, Node **activated_nodes, size_t activated_count,
                                  VisitedSet *context_visited, WaveStatistics *stats) {
+    (void)stats;  /* No longer used - kept for backward compatibility */
     if (!g || !activated_nodes || activated_count == 0) return;
     
     /* 1. Co-activation edges (existing, highest priority) */
@@ -3038,20 +3132,8 @@ void wave_form_intelligent_edges(MelvinGraph *g, Node **activated_nodes, size_t 
             /* Use relative threshold based on local context */
             float local_avg = (node_get_local_outgoing_weight_avg(node) + 
                                node_get_local_incoming_weight_avg(node)) / 2.0f;
-            /* DATA-DRIVEN: Use 75th percentile from actual similarity values (no hardcoded threshold) */
-            float similarity_threshold = (stats && stats->similarity_count > 0) ? 
-                                        stats->similarity_p75 : 0.0f;
-            /* Adaptive blend: weight based on data availability (relative, not hardcoded, no fallbacks) */
-            if (local_avg > 0.0f && similarity_threshold > 0.0f) {
-                /* More stats data → trust stats more; less stats → trust context more */
-                float stats_weight = (stats->similarity_count > 0) ? 
-                                    (float)stats->similarity_count / (stats->similarity_count + 1.0f) : 0.0f;
-                float context_weight = 1.0f - stats_weight;
-                similarity_threshold = similarity_threshold * stats_weight + (local_avg * context_weight);
-            } else if (local_avg > 0.0f) {
-                similarity_threshold = local_avg;  /* Use local context when no stats available */
-            }
-            /* If both are 0.0f, similarity_threshold remains 0.0f (no operation) */
+            /* Use local average as similarity threshold (local context only) */
+            float similarity_threshold = (local_avg > 0.0f) ? local_avg / (local_avg + 1.0f) : 0.0f;
             
             wave_create_edges_from_similarity(g, node, similarity_threshold);
         }
@@ -3178,18 +3260,11 @@ void wave_create_edges_from_coactivation(MelvinGraph *g, Node **activated_nodes,
             /* Initial activation - edge created because nodes activated together */
             edge->activation = true;
             
-            /* DATA-DRIVEN: Bootstrap initial edge weight from source node activation (not hardcoded) */
-            /* Use source node's activation_strength if available (data-driven), otherwise minimal bootstrap */
-            if (from->activation_strength > 0.0f) {
-                /* Use actual activation strength from source node (data-driven) */
-                edge->weight = from->activation_strength * 0.1f;  /* Scale by 0.1 for initial weight */
-            } else {
-                /* No activation available: bootstrap with minimal positive weight */
-                /* This allows edge to participate in weight updates (not a threshold, just bootstrap) */
-                edge->weight = 0.1f;
-            }
+            /* RELATIVE: Initial edge weight relative to local context (no hardcoded multiplier) */
+            /* Use similarity factor of 1.0 for co-activation (direct connection) */
+            edge->weight = compute_relative_initial_edge_weight(from, 1.0f);
             
-            /* Update weight based on activation (may refine initial bootstrap value) */
+            /* Update weight based on activation (may refine initial value) */
             edge_update_weight_local(edge);
             
             /* Add to graph (simple: just connect them) */
@@ -3528,6 +3603,18 @@ bool graph_add_node(MelvinGraph *g, Node *node) {
 bool graph_add_edge(MelvinGraph *g, Edge *edge, Node *from, Node *to) {
     if (!g || !edge || !from || !to) return false;
     
+    /* Check for duplicate using LOCAL knowledge only (O(1) average, no global scan) */
+    /* Check from node's local edges - it knows ALL edges connected to it (both directions) */
+    /* This ensures edges compound on repetition instead of duplicating */
+    Edge *existing = node_find_edge_bidirectional_local(from, to);
+    if (existing) {
+        /* Edge exists - strengthen it (compounding learning) */
+        existing->activation = true;
+        edge_update_weight_local(existing);
+        edge_free(edge);  /* Free the duplicate edge we were about to add */
+        return true;  /* Return success (edge strengthened, not duplicated) */
+    }
+    
     /* Resize if needed (no capacity limits - allocate dynamically) */
     if (g->edge_count >= g->edge_capacity) {
         size_t new_capacity = (g->edge_capacity == 0) ? 1 : g->edge_capacity * 2;
@@ -3586,6 +3673,11 @@ void graph_free(MelvinGraph *g) {
     }
     free(g->edges);
     
+    /* Free context tracking */
+    if (g->last_activated) {
+        free(g->last_activated);
+    }
+    
     free(g);
 }
 
@@ -3610,12 +3702,6 @@ Node** wave_propagate_from_node(Node *node) {
     float propagation_threshold = (local_avg > 0.0f) ? 
                                  local_avg / (local_avg + 1.0f) : 
                                  (node->weight > 0.0f ? node->weight / (node->weight + 1.0f) : 0.0f);
-    // #region agent log
-    char log_data[256];
-    snprintf(log_data, sizeof(log_data), "{\"threshold\":%.3f,\"local_avg\":%.3f,\"node_weight\":%.3f,\"activation\":%.3f}",
-             propagation_threshold, local_avg, node->weight, node->activation_strength);
-    debug_log("melvin.c:3151", "Adaptive propagation threshold computed", log_data);
-    // #endregion agent log
     
     if (node->activation_strength < propagation_threshold) {
         node_update_weight_local(node);
@@ -3700,7 +3786,7 @@ Node** wave_propagate_from_node(Node *node) {
             
             /* Add target node to activated array (it will compute its activation in next step) */
             if (activated_count >= activated_capacity) {
-                activated_capacity = (activated_capacity == 0) ? 4 : activated_capacity * 2;
+                activated_capacity = (activated_capacity == 0) ? 1 : activated_capacity * 2;  /* Minimal context: start at 1 */
                 activated = (Node**)realloc(activated, (activated_capacity + 1) * sizeof(Node*));
                 if (!activated) {
                     free(edge_outputs);
@@ -3740,9 +3826,8 @@ void wave_propagate_multi_step(MelvinGraph *g, Node **initial_nodes, size_t init
     size_t wave_front_size = initial_count;
     memcpy(wave_front, initial_nodes, initial_count * sizeof(Node*));
     
-    /* Initialize adaptive statistics for data-driven thresholds */
-    WaveStatistics stats;
-    wave_statistics_init(&stats);
+    /* Statistics no longer needed - all decisions use local values from nodes/edges */
+    WaveStatistics stats;  /* Empty struct for backward compatibility */
     
     /* Track visited nodes to prevent infinite loops from cycles */
     size_t optimal_hash_size = calculate_optimal_hash_size(g->node_count);
@@ -3839,44 +3924,28 @@ void wave_propagate_multi_step(MelvinGraph *g, Node **initial_nodes, size_t init
                     activated_node->activation_strength = node_compute_activation_strength(activated_node);
                     node_update_weight_local(activated_node);
                     
-                    /* DATA-DRIVEN: Collect statistics for adaptive thresholds (O(1) per node) */
-                    wave_statistics_add_value(&stats, activated_node->activation_strength);
-                    wave_statistics_add_value(&stats, activated_node->weight);
-                    
-                    /* Collect edge weights for similarity edge detection */
-                    for (size_t k = 0; k < activated_node->outgoing_count; k++) {
-                        if (activated_node->outgoing_edges[k]) {
-                            wave_statistics_add_edge_weight(&stats, activated_node->outgoing_edges[k]->weight);
-                        }
-                    }
-                    for (size_t k = 0; k < activated_node->incoming_count; k++) {
-                        if (activated_node->incoming_edges[k]) {
-                            wave_statistics_add_edge_weight(&stats, activated_node->incoming_edges[k]->weight);
-                        }
-                    }
-                    
                     /* Add to next wave front if not visited */
-                    if (!visited_set_contains(visited, activated_node)) {
+                    bool is_new_visit = !visited_set_contains(visited, activated_node);
+                    if (is_new_visit) {
                         visited_set_add(visited, activated_node);
                         
-                    if (next_size >= next_capacity) {
-                        next_capacity = (next_capacity == 0) ? 4 : next_capacity * 2;
-                        next_wave_front = (Node**)realloc(next_wave_front, next_capacity * sizeof(Node*));
-                        if (!next_wave_front) {
-                            free(newly_activated);
-                            free(wave_front);
-                            if (co_activated) free(co_activated);
-                            visited_set_free(visited);
-                            return;
+                        if (next_size >= next_capacity) {
+                            next_capacity = (next_capacity == 0) ? 1 : next_capacity * 2;  /* Minimal context: start at 1 */
+                            next_wave_front = (Node**)realloc(next_wave_front, next_capacity * sizeof(Node*));
+                            if (!next_wave_front) {
+                                free(newly_activated);
+                                free(wave_front);
+                                if (co_activated) free(co_activated);
+                                visited_set_free(visited);
+                                return;
+                            }
                         }
-                    }
                         next_wave_front[next_size++] = activated_node;
-                    }
-                    
-                    /* UNIFIED: Track co-activated nodes for edge/hierarchy formation */
-                    if (!visited_set_contains(visited, activated_node)) {
+                        
+                        /* UNIFIED: Track co-activated nodes for edge/hierarchy formation */
+                        /* Only add if newly visited (avoid duplicate check) - follows README: efficient local operations */
                         if (co_activated_count >= co_activated_capacity) {
-                            co_activated_capacity = (co_activated_capacity == 0) ? 4 : co_activated_capacity * 2;
+                            co_activated_capacity = (co_activated_capacity == 0) ? 1 : co_activated_capacity * 2;  /* Minimal context: start at 1 */
                             co_activated = (Node**)realloc(co_activated, co_activated_capacity * sizeof(Node*));
                             if (!co_activated) {
                                 free(newly_activated);
@@ -3904,9 +3973,6 @@ void wave_propagate_multi_step(MelvinGraph *g, Node **initial_nodes, size_t init
         /* CONTEXT: All nodes added to visited set are automatically part of context */
         /* Wave propagation tracks all explored nodes in visited set - this IS the context */
         /* No need for separate tracking - visited set already contains all paths recently traveled */
-        
-        /* DATA-DRIVEN: Compute percentiles from collected statistics (O(1) - fixed bucket count) */
-        wave_statistics_compute_percentiles(&stats);
         
         /* UNIVERSAL: Form combinations from co-activated nodes (hierarchy emerges naturally) */
         /* All nodes can combine when they co-activate strongly - universal law */
@@ -3993,14 +4059,24 @@ void node_transfer_incoming_to_hierarchy(MelvinGraph *g, Node *node1, Node *node
     if (!g || !node1 || !node2 || !combined) return;
     
     /* Simple rule: Transfer incoming edges (preserve connectivity to combined node) */
+    /* LEARN FROM EXISTING: Check if edges already exist before creating */
     for (size_t i = 0; i < node1->incoming_count; i++) {
         Edge *old_edge = node1->incoming_edges[i];
         if (!old_edge || !old_edge->from_node) continue;
         
-        Edge *new_edge = edge_create(old_edge->from_node, combined, true);
-        if (new_edge) {
-            new_edge->weight = old_edge->weight;
-            graph_add_edge(g, new_edge, old_edge->from_node, combined);
+        Edge *existing = node_find_edge_to(old_edge->from_node, combined);
+        if (existing) {
+            /* Edge already exists - strengthen it (learning through repetition) */
+            existing->activation = true;
+            edge_update_weight_local(existing);
+        } else {
+            /* Create new edge */
+            Edge *new_edge = edge_create(old_edge->from_node, combined, true);
+            if (new_edge) {
+                new_edge->weight = compute_relative_initial_edge_weight(old_edge->from_node, old_edge->weight);
+                new_edge->activation = true;
+                graph_add_edge(g, new_edge, old_edge->from_node, combined);
+            }
         }
     }
     
@@ -4008,10 +4084,19 @@ void node_transfer_incoming_to_hierarchy(MelvinGraph *g, Node *node1, Node *node
         Edge *old_edge = node2->incoming_edges[i];
         if (!old_edge || !old_edge->from_node) continue;
         
-        Edge *new_edge = edge_create(old_edge->from_node, combined, true);
-        if (new_edge) {
-            new_edge->weight = old_edge->weight;
-            graph_add_edge(g, new_edge, old_edge->from_node, combined);
+        Edge *existing = node_find_edge_to(old_edge->from_node, combined);
+        if (existing) {
+            /* Edge already exists - strengthen it (learning through repetition) */
+            existing->activation = true;
+            edge_update_weight_local(existing);
+        } else {
+            /* Create new edge */
+            Edge *new_edge = edge_create(old_edge->from_node, combined, true);
+            if (new_edge) {
+                new_edge->weight = compute_relative_initial_edge_weight(old_edge->from_node, old_edge->weight);
+                new_edge->activation = true;
+                graph_add_edge(g, new_edge, old_edge->from_node, combined);
+            }
         }
     }
     
@@ -4021,10 +4106,19 @@ void node_transfer_incoming_to_hierarchy(MelvinGraph *g, Node *node1, Node *node
         Edge *old_edge = node2->outgoing_edges[i];
         if (!old_edge || !old_edge->to_node) continue;
         
-        Edge *new_edge = edge_create(combined, old_edge->to_node, true);
-        if (new_edge) {
-            new_edge->weight = old_edge->weight;
-            graph_add_edge(g, new_edge, combined, old_edge->to_node);
+        Edge *existing = node_find_edge_to(combined, old_edge->to_node);
+        if (existing) {
+            /* Edge already exists - strengthen it (learning through repetition) */
+            existing->activation = true;
+            edge_update_weight_local(existing);
+        } else {
+            /* Create new edge */
+            Edge *new_edge = edge_create(combined, old_edge->to_node, true);
+            if (new_edge) {
+                new_edge->weight = compute_relative_initial_edge_weight(combined, old_edge->weight);
+                new_edge->activation = true;
+                graph_add_edge(g, new_edge, combined, old_edge->to_node);
+            }
         }
     }
 }
@@ -4054,6 +4148,127 @@ Node* node_fill_blank(Node *blank_node, const uint8_t *pattern, size_t pattern_s
     return filled_node;
 }
 
+/* Compute output readiness based on pattern maturity (relative to local context) */
+/* DATA-DRIVEN: Uses edge existence and strength to measure learned patterns */
+/* Returns relative readiness score (0.0-1.0) where higher = more mature patterns */
+/* Following README principle: all thresholds relative to local context, no hardcoded values */
+float compute_output_readiness(MelvinGraph *g, Node **input_nodes, size_t input_count) {
+    if (!g || !input_nodes || input_count == 0) return 0.0f;
+    
+    /* Measure sequential edge strength from input nodes */
+    float total_edge_weight = 0.0f;
+    size_t total_edge_count = 0;
+    float max_edge_weight = 0.0f;
+    float min_edge_weight = FLT_MAX;
+    
+    /* Also collect local context from nodes (for relative comparison) */
+    float total_local_avg = 0.0f;
+    size_t nodes_with_context = 0;
+    
+    /* For each input node, measure strength of outgoing edges */
+    /* Outgoing edges represent learned sequential patterns (what comes next) */
+    for (size_t i = 0; i < input_count; i++) {
+        Node *node = input_nodes[i];
+        if (!node) continue;
+        
+        /* Get local context for this node (data-driven threshold basis) */
+        float local_avg = node_get_local_outgoing_weight_avg(node);
+        if (local_avg > 0.0f) {
+            total_local_avg += local_avg;
+            nodes_with_context++;
+        }
+        
+        /* Examine ALL outgoing edges - any edge represents learning */
+        for (size_t j = 0; j < node->outgoing_count; j++) {
+            Edge *edge = node->outgoing_edges[j];
+            if (!edge) continue;
+            
+            total_edge_weight += edge->weight;
+            total_edge_count++;
+            
+            /* Track maximum and minimum edge weight (for relative comparison) */
+            if (edge->weight > max_edge_weight) {
+                max_edge_weight = edge->weight;
+            }
+            if (edge->weight < min_edge_weight) {
+                min_edge_weight = edge->weight;
+            }
+        }
+    }
+    
+    /* If no edges exist, pattern is completely novel - no output readiness */
+    if (total_edge_count == 0) return 0.0f;
+    
+    /* Average edge weight represents pattern maturity */
+    float avg_edge_weight = total_edge_weight / (float)total_edge_count;
+    
+    /* RELATIVE: Compute threshold context from actual data, not hardcoded values */
+    /* Use local averages as context - this is what nodes "know" about their neighborhood */
+    float local_context = 0.0f;
+    if (nodes_with_context > 0) {
+        local_context = total_local_avg / (float)nodes_with_context;
+    }
+    
+    /* If no local context available, use edge weight range as context */
+    if (local_context <= 0.0f && max_edge_weight > min_edge_weight) {
+        local_context = (max_edge_weight + min_edge_weight) / 2.0f;  /* Midpoint of range */
+    }
+    
+    /* If still no context, use max_edge_weight as minimal context */
+    if (local_context <= 0.0f && max_edge_weight > 0.0f) {
+        local_context = max_edge_weight;
+    }
+    
+    /* RELATIVE: Normalize average weight relative to local context */
+    /* Pattern: x / (x + context) where context comes from data */
+    /* This measures how mature patterns are compared to what exists locally */
+    float relative_readiness = 0.0f;
+    if (local_context > 0.0f) {
+        /* Compare average to local context - stronger relative to context = more ready */
+        relative_readiness = avg_edge_weight / (avg_edge_weight + local_context);
+    } else {
+        /* No context available: use self-normalization pattern */
+        /* When no local context exists, compare to max (strongest pattern) */
+        if (max_edge_weight > 0.0f) {
+            relative_readiness = avg_edge_weight / (avg_edge_weight + max_edge_weight);
+        } else {
+            /* Absolute minimum: no data available */
+            return 0.0f;
+        }
+    }
+    
+    /* RELATIVE: Also consider edge count relative to node count (more edges = more learning) */
+    /* More edges per node suggests more mature patterns */
+    float edge_density_factor = 0.0f;
+    if (input_count > 0) {
+        float edges_per_node = (float)total_edge_count / (float)input_count;
+        /* Normalize: more edges = higher factor, but relative to what's typical */
+        /* Use input_count as context (more nodes = more opportunities for edges) */
+        float density_context = (float)input_count;  /* Context from data */
+        edge_density_factor = edges_per_node / (edges_per_node + density_context);
+    }
+    
+    /* RELATIVE: Combine weight maturity with edge density (both from data) */
+    /* Weight factor represents strength, density factor represents pattern richness */
+    /* Combine using relative weighting based on available data */
+    float combined_readiness = 0.0f;
+    if (edge_density_factor > 0.0f && relative_readiness > 0.0f) {
+        /* Both factors available: combine relative to their magnitudes */
+        float weight_factor_ratio = relative_readiness / (relative_readiness + edge_density_factor);
+        float density_factor_ratio = edge_density_factor / (relative_readiness + edge_density_factor);
+        combined_readiness = (relative_readiness * weight_factor_ratio) + 
+                           (edge_density_factor * density_factor_ratio);
+    } else if (relative_readiness > 0.0f) {
+        /* Only weight factor available */
+        combined_readiness = relative_readiness;
+    } else if (edge_density_factor > 0.0f) {
+        /* Only density factor available */
+        combined_readiness = edge_density_factor;
+    }
+    
+    return combined_readiness;  /* 0.0-1.0 range, fully data-driven */
+}
+
 /* Collect output from direct input nodes and their sequential continuations only */
 /* KEY DISTINCTION: Activation (from wave prop) != Output (direct input intent) */
 /* Wave propagation activates nodes for exploration/context, but output should only */
@@ -4079,30 +4294,13 @@ void wave_collect_output(MelvinGraph *g, Node **direct_input_nodes, size_t direc
     
     size_t output_capacity = 0;
     
-    /* Output from direct input sequence (this is the primary output) */
-    /* This ensures clean output matching the input intent */
-    /* IMPORTANT: Allow duplicates - input sequence may have same node multiple times (e.g., "hello" has 'l' twice) */
-    /* Don't use visited set here - output should preserve the exact input sequence */
+    /* Mark input nodes as visited to use as starting context for continuations */
+    /* DON'T echo input - output should only be learned continuations */
+    /* This matches biological systems: stimulus triggers response, not echo */
     for (size_t i = 0; i < direct_input_count; i++) {
-        Node *node = direct_input_nodes[i];
-        if (!node || node->payload_size == 0) continue;
-        
-        /* Add node payload to output (allow duplicates - preserves input sequence) */
-        size_t new_size = *output_size + node->payload_size;
-        if (new_size > output_capacity) {
-            output_capacity = (output_capacity == 0) ? node->payload_size * 2 : output_capacity * 2;
-            *output = (uint8_t*)realloc(*output, output_capacity);
-            if (!*output) {
-                *output_size = 0;
-                visited_set_free(visited);
-                return;
-            }
+        if (direct_input_nodes[i]) {
+            visited_set_add(visited, direct_input_nodes[i]);
         }
-        memcpy(*output + *output_size, node->payload, node->payload_size);
-        *output_size = new_size;
-        
-        /* Mark as visited for extension (prevent cycles in learned continuations) */
-        visited_set_add(visited, node);
     }
     
     /* Optional: Extend output with learned sequential continuations */
@@ -4140,47 +4338,63 @@ void wave_collect_output(MelvinGraph *g, Node **direct_input_nodes, size_t direc
                 float best_sequential_score = 0.0f;
                 extension_step++;
                 
-                /* Find strongest sequential edge using intelligent node/edge computation */
-                /* Nodes as mini neural nets: use activation_strength (computed during wave propagation) */
-                /* Edges as transformers: use edge_transform_activation (intelligent transformation) */
-                float max_transformed = 0.0f;
+                /* Find strongest SEQUENTIAL edge (co-activation only, no similarity boosts) */
+                /* Philosophy: Output should reproduce learned sequences exactly, not generalize */
+                /* Use RAW edge weight (co-activation strength) without similarity boosts */
+                /* Similarity boosts are for generalization during learning, not output reproduction */
+                float max_edge_weight = 0.0f;
                 
-                /* First pass: compute transformed activations for relative comparison */
+                /* First pass: find max edge weight for normalization */
                 for (size_t i = 0; i < current->outgoing_count; i++) {
                     Edge *edge = current->outgoing_edges[i];
                     if (!edge || !edge->to_node) continue;
-                    if (visited_set_contains(visited, edge->to_node)) continue;  /* Avoid cycles */
                     
-                    /* Edge transforms activation (transformer function) */
-                    /* Uses node activation_strength (mini neural net output) */
-                    float transformed = edge_transform_activation(edge, current->activation_strength);
+                    /* ALLOW self-loops: repeated chars must be emitted */
+                    /* Self-loop = edge where from_node == to_node */
+                    /* Example: in "hello", the 'l'→'l' self-loop must be followed */
+                    bool is_self_loop = (edge->from_node == edge->to_node);
+                    if (!is_self_loop && visited_set_contains(visited, edge->to_node)) {
+                        continue;  /* Avoid cycles, but allow self-loops */
+                    }
                     
-                    if (transformed > max_transformed) {
-                        max_transformed = transformed;
+                    if (edge->weight > max_edge_weight) {
+                        max_edge_weight = edge->weight;
                     }
                 }
                 
-                /* Second pass: select best edge using transformed activation (intelligent selection) */
+                /* Second pass: select strongest sequential edge (pure co-activation) */
+                /* PREFER self-loops: repeated characters must be fully emitted */
+                /* Example: in "hello", 'll' is a self-loop on 'l' node */
+                /* When at 'l', must follow self-loop before going to 'o' */
                 for (size_t i = 0; i < current->outgoing_count; i++) {
                     Edge *edge = current->outgoing_edges[i];
                     if (!edge || !edge->to_node) continue;
-                    if (visited_set_contains(visited, edge->to_node)) continue;  /* Avoid cycles */
                     
-                    /* Edge transforms activation (transformer function) */
-                    float transformed = edge_transform_activation(edge, current->activation_strength);
-                    
-                    /* Score = transformed activation (intelligent edge transformation) */
-                    /* Normalize by local context for relative comparison */
-                    float score = 0.0f;
-                    if (local_outgoing_avg > 0.0f && max_transformed > 0.0f) {
-                        score = transformed / max_transformed;  /* Relative to best transformation */
-                    } else {
-                        score = transformed;
+                    /* ALLOW self-loops: repeated chars must be emitted */
+                    /* Self-loop = edge where from_node == to_node */
+                    bool is_self_loop = (edge->from_node == edge->to_node);
+                    if (!is_self_loop && visited_set_contains(visited, edge->to_node)) {
+                        continue;  /* Avoid cycles, but allow self-loops */
                     }
                     
-                    /* Only consider edges with meaningful transformed activation (learned sequential patterns) */
-                    /* This filters out similarity/context edges (which have lower transformed activation) */
-                    if (transformed > 0.2f && score > best_sequential_score) {
+                    /* Score = pure edge weight (co-activation strength from repeated sequences) */
+                    /* Normalize by max weight for relative comparison */
+                    float score = 0.0f;
+                    if (max_edge_weight > 0.0f) {
+                        score = edge->weight / max_edge_weight;  /* Relative to strongest edge */
+                    } else {
+                        score = edge->weight;
+                    }
+                    
+                    /* BOOST self-loops: repeated chars must be fully emitted before different chars */
+                    /* Self-loop = edge where from_node == to_node (e.g., 'l' -> 'l' in "hello") */
+                    /* Philosophy: Complete repetitions before moving to new patterns */
+                    if (is_self_loop) {
+                        score *= 1.5f;  /* Prefer self-loops by 50% to handle repeated chars */
+                    }
+                    
+                    /* Select edge with highest co-activation strength (learned sequential pattern) */
+                    if (edge->weight > 0.0f && score > best_sequential_score) {
                         best_sequential_score = score;
                         best_sequential_edge = edge;
                     }
@@ -4193,10 +4407,21 @@ void wave_collect_output(MelvinGraph *g, Node **direct_input_nodes, size_t direc
                 }
                 
                 /* Follow best sequential edge */
+                Node *prev_current = current;
                 current = best_sequential_edge->to_node;
-                if (visited_set_contains(visited, current)) break;  /* Cycle detected, stop */
                 
-                visited_set_add(visited, current);
+                /* ALLOW self-loops: don't break on self-loop revisit */
+                /* Self-loop means we're emitting a repeated character */
+                bool is_self_loop = (prev_current == current);
+                if (!is_self_loop && visited_set_contains(visited, current)) {
+                    break;  /* Cycle detected (not self-loop), stop */
+                }
+                
+                /* Only add to visited set if not a self-loop */
+                /* Self-loops can be followed multiple times to emit repeated chars */
+                if (!is_self_loop) {
+                    visited_set_add(visited, current);
+                }
                 
                 /* Add continuation to output */
                 if (current->payload_size > 0) {
@@ -4216,13 +4441,16 @@ void wave_collect_output(MelvinGraph *g, Node **direct_input_nodes, size_t direc
                 
                 /* Track confidence score for adaptive threshold computation */
                 if (confidence_count >= confidence_capacity) {
-                    confidence_capacity = (confidence_capacity == 0) ? 4 : confidence_capacity * 2;
+                    confidence_capacity = (confidence_capacity == 0) ? 1 : confidence_capacity * 2;  /* Minimal context: start at 1 */
                     confidence_history = (float*)realloc(confidence_history, confidence_capacity * sizeof(float));
                     if (!confidence_history) {
-                        /* If allocation fails, compute from current confidence and step (no fallback) */
-                        float base_increase = 0.05f;  /* 5% base */
-                        float step_factor = (float)extension_step * 0.01f;  /* +1% per step */
-                        float increase = fminf(base_increase + step_factor, 0.2f);  /* Cap at 20% */
+                        /* RELATIVE: Compute increase from available data (confidence_threshold, extension_step) */
+                        /* Use relative normalization patterns - no hardcoded values */
+                        float base_increase = 1.0f / (confidence_threshold + 1.0f);  /* Inverse pattern: smaller for larger thresholds */
+                        float step_factor = (float)extension_step / ((float)extension_step + 1.0f);  /* Normalize step */
+                        float total_increase = base_increase + step_factor;
+                        /* RELATIVE: Normalize total increase to prevent explosion */
+                        float increase = total_increase / (total_increase + 1.0f);  /* Always < 1.0f, self-normalizing */
                         confidence_threshold *= (1.0f + increase);
                     }
                 }

@@ -1,8 +1,8 @@
 # Melvin: Emergent Intelligence System
 
-## Vision: What We Want
+## Vision and Implementation
 
-This document describes the design vision for Melvin - what the system should be and how it should work. This is the **goal**, separate from the current implementation in `melvin.c`. After reading this, we compare it to the implementation to identify gaps and alignment.
+This document describes the design vision for Melvin and how it is implemented. The current implementation in `melvin.c` follows these principles: **local measurements only**, **no hardcoded thresholds**, and **data-driven adaptation**. The system uses local value computations (O(1) access to cached node/edge averages) instead of global statistics, aligning with the core philosophy.
 
 ---
 
@@ -33,11 +33,14 @@ This document describes the design vision for Melvin - what the system should be
 **What This Means**:
 - No magic numbers (no `0.5f`, `0.7f`, etc. as thresholds)
 - **No fallbacks**: When no data exists, use minimal available context or return 0.0f (neutral, not a threshold)
+- **Minimal context like nature**: Initial capacities start at absolute minimum (1) and grow immediately when data arrives
+  - Hash tables: Start with size 1, grow to optimal size based on graph data
+  - Arrays: Start with capacity 1, double when full (grows immediately)
+  - Like biological systems: Start from seed (1), grow from environment (data)
 - All thresholds computed relative to local context
 - Pattern size limits adapt based on what exists locally
 - Hash table sizes adapt to graph size
 - Learning rates adapt based on local change rates
-- Histogram bucket counts adapt to data volume
 - System scales from 1 byte to unlimited size naturally
 - **Zero is neutral**: Returning 0.0f means "no operation possible" or "no data available", not a threshold value
 
@@ -48,6 +51,7 @@ This document describes the design vision for Melvin - what the system should be
 - Self-tuning system that optimizes itself
 - **No hidden assumptions**: Every value comes from data, never from programmer guesses
 - **True data-driven**: System only operates when it has data to operate on
+- **Biological-like growth**: Starts from seed (1), grows from environment (data), like mycelium networks
 
 ### 3. Relative Adaptive Stability
 
@@ -55,7 +59,7 @@ This document describes the design vision for Melvin - what the system should be
 
 **What This Means**:
 - **Adaptive Epsilon**: Numerical stability constants scale with data range (e.g., `epsilon = range * 0.001f` instead of hardcoded `1e-6f`)
-- **Adaptive Clipping**: Bounds computed from observed percentiles (e.g., `max_boost = p95 * 2.0f` from historical data)
+- **Adaptive Clipping**: Bounds computed from local node/edge values (e.g., `max_boost = local_avg * 2.0f` from node's neighbors)
 - **Adaptive Smoothing**: Smoothing factors adapt to change rate (fast changes → less smoothing, slow changes → more smoothing)
 - **Adaptive Minimum Samples**: Required sample sizes adapt to data variance (high variance → more samples, low variance → fewer samples)
 - **Scale-Aware Operations**: All stability mechanisms scale with data magnitude
@@ -74,9 +78,11 @@ This document describes the design vision for Melvin - what the system should be
 
 **Examples**:
 - Epsilon for division: `epsilon = compute_adaptive_epsilon(value_range)` scales with data
-- Clipping bounds: `max_value = compute_percentile_from_array(observed_values, 95) * 2.0f` from data
-- Smoothing factor: `alpha = f(change_rate)` adapts to how fast data changes
+- Clipping bounds: `max_value = local_avg * multiplier` where multiplier computed from local edge weights
+- Smoothing factor: `alpha = f(change_rate)` adapts to how fast data changes, clipped relative to local context
 - Minimum samples: `min_samples = f(data_variance)` adapts to data quality
+- Initial capacities: Start at 1 (absolute minimum), grow immediately when data arrives (like nature)
+- Hash table size: Start at 1 when graph empty, grows to optimal based on graph size
 
 ### 4. Compounding Learning
 
@@ -112,7 +118,7 @@ Each level compounds: understanding at Level N multiplies understanding at Level
 **What This Means**:
 - **When exploring new territory**: More exploratory behavior, slower learning
 - **When building on existing knowledge**: More compounding behavior, faster learning
-- **Adaptive statistics**: Histogram buckets adapt to data volume
+- **Local value computations**: All thresholds computed from node's own edges and neighbors (O(1) access)
 - **Adaptive learning rates**: Based on local context and observed change rates
 - **Adaptive pattern size limits**: Based on local node sizes
 - **Adaptive hash table sizes**: Based on graph size
@@ -385,6 +391,19 @@ void handle_usb_microphone(MelvinMFile *mfile) {
 - Port ID in payload allows system to differentiate patterns from different sources
 - No internal port routing needed—graph learns patterns, routing is external
 
+**Cross-Modal Associations (How the Brain Connects Different Data Types)**:
+- **Unified Graph**: All nodes (audio, text, video, sensor data) exist in the same graph
+- **Data Preservation**: Each node stores its actual data bytes (audio bytes stay audio bytes, text stays text)
+- **Edge Formation**: Nodes from different modalities connect through:
+  - **Co-activation edges**: When nodes activate together (e.g., "meow" sound + cat image arrive simultaneously)
+  - **Similarity edges**: When patterns are similar (computed from actual payload bytes)
+  - **Context edges**: When wave propagation connects them through shared exploration paths
+- **Cross-Modal Influence**: Activation can propagate from one modality to another through edges:
+  - Audio input can activate related text nodes (if edges exist between them)
+  - Text input can influence audio outputs (through learned associations)
+  - Output routing determines which port receives the result, but the graph learns associations across all types
+- **Example**: If "meow" audio frequently co-occurs with cat images, edges form between those patterns. Later, "meow" audio input can activate cat-related text nodes, influencing text output—even though audio bytes remain audio bytes and text remains text.
+
 **Example: Multiple Devices**:
 ```c
 // Handle multiple USB devices
@@ -403,6 +422,8 @@ void process_multiple_devices(MelvinMFile *mfile) {
     // Wave propagation learns: audio patterns + visual patterns → cross-modal edges
     // System learns: "meow" audio pattern + cat image pattern are related
     // All unified in single graph, no separation by port
+    // Audio bytes create audio nodes, image bytes create image nodes
+    // But edges connect them, allowing cross-modal activation
 }
 ```
 
@@ -411,9 +432,15 @@ void process_multiple_devices(MelvinMFile *mfile) {
 - Example: Port 5 (USB mic) → Port 10 (USB speaker)
 - Routing handled outside `.m` file (external layer)
 - `.m` file doesn't need to know about port routing—just processes bytes
+- **Important**: Routing determines where output goes, but cross-modal associations in the graph can influence outputs regardless of routing
+  - Audio input → text output is possible if edges connect them
+  - Text input → audio output is possible if associations exist
+  - The graph learns relationships; routing just determines the delivery mechanism
 
 **Key Principles**:
 - **Unified Graph**: All data (from any port) flows through unified graph—no port-based separation
+- **Data Type Preservation**: Nodes store actual data bytes (audio, text, video remain distinct)
+- **Cross-Modal Associations**: Edges connect nodes across modalities, enabling cross-modal influence
 - **External Packaging**: Port frame packaging happens outside `.m` file
 - **Port ID for Routing**: Port ID extracted for I/O routing, but port ID also in payload for pattern learning
 - **No Internal Port Routing**: `.m` file doesn't route ports internally—graph learns patterns, routing is external
@@ -432,7 +459,7 @@ void process_multiple_devices(MelvinMFile *mfile) {
 - Hash table sizes adapt to graph size
 - Pattern size limits adapt to local node sizes
 - Learning rates adapt to observed change rates
-- Histogram buckets adapt to data volume
+- Local value thresholds adapt to each node's neighborhood
 - System adapts to any environment automatically
 - No environment-specific code needed
 
@@ -527,11 +554,20 @@ void process_multiple_devices(MelvinMFile *mfile) {
    - Each level represents higher abstraction
    - Forms automatically, not explicitly triggered
 
-6. **Output Collection**:
-   - Collect output from direct input nodes
-   - Extend with learned sequential continuations
-   - Output represents intent, not all contextual activations
+6. **Output Readiness Decision** (Relative Threshold):
+   - Wave propagation ALWAYS happens (thinking/internal pattern updates)
+   - Output decision based on pattern maturity (co-activation edge strength)
+   - Measures relative strength of learned patterns vs. local context
+   - If patterns mature (relative threshold): collect output
+   - If patterns immature: skip output (pure thinking mode)
+   - No hardcoded threshold - relative to local measurements
+
+7. **Output Collection** (When Patterns Mature):
+   - Collect output from learned sequential continuations only
+   - Does NOT echo input - output is generated continuation, not repetition
+   - Output represents learned intent, not all contextual activations
    - Follows co-activation edges (learned patterns)
+   - If no continuations found: no output generated (pure thinking mode)
 
 ### Node Operations
 
@@ -733,11 +769,11 @@ void process_multiple_devices(MelvinMFile *mfile) {
 
 **How System Adapts**:
 
-1. **Adaptive Statistics**:
-   - Histogram buckets adapt to data volume
-   - Grow when more precision needed
-   - Adapt to distribution of values
-   - Data-driven bucket counts
+1. **Local Value Computations**:
+   - All thresholds computed from node's local context (edges and neighbors)
+   - O(1) access to cached local averages (maintained incrementally)
+   - No global statistics needed - each node uses its own neighborhood
+   - Data-driven thresholds from actual node/edge values
 
 2. **Adaptive Learning Rates**:
    - Based on observed change rate
@@ -860,7 +896,7 @@ void process_multiple_devices(MelvinMFile *mfile) {
 3. **Hierarchy formation**: Emerges from pattern repetition
 4. **Blank nodes**: Learn categories from connections
 5. **Priority queues**: Use learned structure to guide exploration
-6. **Adaptive statistics**: Buckets adapt to data
+6. **Local value computations**: Thresholds from node's own edges/neighbors (O(1))
 7. **Adaptive learning rates**: Based on observed change
 8. **Universal node operations**: All nodes work the same way
 9. **Local weight updates**: No global optimization
@@ -1134,27 +1170,74 @@ void process_multiple_devices(MelvinMFile *mfile) {
 - Stops when propagation naturally weakens
 - Relative to initial energy, not absolute
 
-### Adaptive Statistics System
+**Output Readiness** (Thinking vs Output):
+- **Thinking (always)**: Wave propagation runs for every input
+  - Updates node weights, edge weights, activations
+  - Creates/strengthens edges through co-activation
+  - Explores context and builds associations
+  - This happens regardless of output decision
+- **Output (conditional)**: Only when patterns are mature
+  - Measured by co-activation edge strength from input nodes
+  - Compares learned pattern strength to local context
+  - Relative threshold: `output_readiness >= output_threshold`
+  - Readiness = `avg_coactivation / (max_edge_weight + avg_coactivation)`
+  - Threshold = `local_context / (local_context + 1.0f)`
+  - If mature: collect output from learned sequential continuations
+  - If immature: skip output (pure thinking mode)
+- **Biological analogy**:
+  - Familiar stimulus → strong patterns → external output (speech/action)
+  - Novel stimulus → weak patterns → internal processing only (thought)
+- **Data-driven**: No hardcoded thresholds, adapts to graph's learned patterns
 
-**Histogram Buckets**:
-- Start with small bucket count (e.g., 32)
-- Grow when data volume increases (e.g., 10x more values than buckets)
-- Double bucket count when growing
-- Redistribute existing values proportionally
-- No maximum (adapts to data)
+**Output Protocol** (How Output is Generated and Routed):
+- **Input Processing**: Every input triggers wave propagation (thinking)
+  - Input packaged with port_id in first byte (CAN bus format)
+  - Wave propagation always runs (updates patterns internally)
+  
+- **Output Readiness Decision**: Based on pattern maturity (relative threshold)
+  - `output_readiness = compute_output_readiness(graph, input_nodes)`
+  - Measures co-activation edge strength from input nodes
+  - If `output_readiness > 0.0f`: patterns exist → collect output
+  - If `output_readiness == 0.0f`: no patterns → pure thinking (no output to ports)
+  
+- **Output Collection**: Only learned sequential continuations
+  - Starts from last input node (input nodes marked as visited context)
+  - Follows co-activation edges (learned patterns)
+  - Extends output based on relative confidence thresholds
+  - Does NOT include input nodes (no echoing)
+  - Output is raw data bytes (no port_id in output)
+  
+- **Output Routing**: External port manager handles routing
+  - Reads output from `.m` file universal_output
+  - Uses routing table: `input_port_id → output_port_id`
+  - Wraps output in PortFrame with destination port_id
+  - Sends to appropriate output port
+  
+- **Internal Feedback Loop** (Future):
+  - Special port_id (e.g., 255) for internal thoughts
+  - Output routed to feedback port loops back to input
+  - External validation prevents "junk" from forming
+  - System learns associations through repetition
 
-**Percentile Computation**:
-- Compute percentiles from histogram
-- O(1) query time
-- Adaptive bucket count maintains precision
-- Used for thresholds (e.g., 75th percentile similarity threshold)
+### Local Value Computation System
 
-**Edge Weight Statistics**:
-- Track min/max edge weights in wave
-- Compute percentiles (25th, 50th, 75th)
-- Use percentiles to identify edge types (relative, not absolute)
-- Similarity edges: weight between 25th-75th percentile
-- Co-activation edges: weight above 75th percentile
+**Local Context Access**:
+- All thresholds computed from node's own edges and immediate neighbors
+- O(1) access to cached local averages (maintained incrementally)
+- No global statistics collection needed
+- Each node uses its own neighborhood for decisions
+
+**Local Average Computation**:
+- `node_get_local_outgoing_weight_avg()`: Average of outgoing edge weights (O(1))
+- `node_get_local_incoming_weight_avg()`: Average of incoming edge weights (O(1))
+- Cached sums maintained incrementally when edges change
+- No histogram building or percentile computation needed
+
+**Edge Type Detection**:
+- Similarity edges: weight between 50%-150% of local average
+- Co-activation edges: weight above local average
+- All comparisons relative to node's local context, not global percentiles
+- More context-aware and adaptive to each node's neighborhood
 
 ### Adaptive Learning Rates
 
@@ -1359,9 +1442,21 @@ void process_multiple_devices(MelvinMFile *mfile) {
 
 ---
 
-## Implementation Status Comparison
+## Implementation Status
 
-*[This section will be populated by comparing the vision above to what exists in melvin.c]*
+**Current Implementation Aligns with Vision:**
 
-*[This section will be populated by comparing the vision above to what exists in melvin.c]*
+✅ **Local Measurements Only**: All thresholds computed from node's local context (edges and neighbors), not global statistics
+
+✅ **No Hardcoded Thresholds**: All thresholds are data-driven, computed from local averages using O(1) cached access
+
+✅ **No Global Statistics**: Removed histogram/percentile system - uses local value computations exclusively
+
+✅ **O(1) Performance**: Local averages accessed from cached sums maintained incrementally
+
+✅ **Context-Aware**: Each node uses its own neighborhood for decisions, not global percentiles
+
+✅ **Self-Regulating**: System adapts through local feedback loops without global state
+
+The implementation now fully matches the vision: **local measurements only**, **no global state**, **data-driven adaptation**.
 

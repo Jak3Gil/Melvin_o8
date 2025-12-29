@@ -22,8 +22,15 @@ static void cpu_batch_compute_statistics(Node **nodes, size_t node_count,
 static void cpu_batch_update_weights(Node **nodes, size_t node_count);
 
 /* CUDA initialization function (defined in melvin_gpu_cuda.cu if CUDA available) */
-/* Use weak linking: if CUDA not linked, this will be NULL and CPU fallback is used */
-bool melvin_gpu_cuda_init(MelvinGPUContext *ctx) __attribute__((weak));
+#ifdef CUDA_AVAILABLE
+extern bool melvin_gpu_cuda_init(MelvinGPUContext *ctx);
+#else
+/* Stub when CUDA not available */
+static bool melvin_gpu_cuda_init(MelvinGPUContext *ctx) {
+    (void)ctx;  /* Unused parameter */
+    return false;
+}
+#endif
 
 /* Initialize GPU context - auto-detects CUDA if available */
 bool melvin_gpu_init(MelvinGPUContext **ctx) {
@@ -38,13 +45,12 @@ bool melvin_gpu_init(MelvinGPUContext **ctx) {
     if (!new_ctx) return false;
     
     /* Try to initialize CUDA - if CUDA is available and linked, this will succeed */
-    /* melvin_gpu_cuda_init is defined in melvin_gpu_cuda.cu when CUDA is available */
     bool cuda_success = false;
     
-    /* Check if CUDA init function is available (weak symbol check) */
-    if (melvin_gpu_cuda_init != NULL) {
-        cuda_success = melvin_gpu_cuda_init(new_ctx);
-    }
+#ifdef CUDA_AVAILABLE
+    /* CUDA module is linked - try to initialize */
+    cuda_success = melvin_gpu_cuda_init(new_ctx);
+#endif
     
     if (!cuda_success) {
         /* CPU fallback mode - GPU not available */
