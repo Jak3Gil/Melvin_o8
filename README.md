@@ -1,5 +1,29 @@
 # Melvin: Emergent Intelligence System
 
+## Quick Start
+
+**Production System Only** - There is no separate test infrastructure. The production system IS the test system.
+
+```bash
+# Build
+make all-apps
+
+# Run production dataset processor
+./dataset_port dataset.txt brain.m
+
+# Monitor in another terminal
+./monitor_brain.sh brain.m
+# or
+./show_brain brain.m
+
+# Detailed analysis
+./analyze_mfile brain.m analysis.txt
+```
+
+See [PRODUCTION.md](PRODUCTION.md) for complete production system documentation.
+
+---
+
 ## Vision and Implementation
 
 This document describes the design vision for Melvin and how it is implemented. The current implementation in `melvin.c` follows these principles: **local measurements only**, **no hardcoded thresholds**, and **data-driven adaptation**. The system uses local value computations (O(1) access to cached node/edge averages) instead of global statistics, aligning with the core philosophy.
@@ -148,6 +172,9 @@ Each level compounds: understanding at Level N multiplies understanding at Level
 - System improves forever, never stops learning
 - No catastrophic forgetting (old patterns remain in structure)
 - Incremental learning (only affected nodes update)
+- **Local edge decay**: Nodes optimize their edges locally - unused edges decay relative to local context
+- **Relative decay**: Weaker edges (relative to local average) decay faster, strong edges persist
+- **No hardcoded forgetting thresholds**: Decay rate computed from local edge weight distribution
 
 **Why This Matters**:
 - System adapts to new data immediately
@@ -155,6 +182,9 @@ Each level compounds: understanding at Level N multiplies understanding at Level
 - Lifelong learning - knowledge accumulates
 - Can learn from live data streams
 - System improves over time automatically
+- **Intelligent forgetting**: Unused patterns decay naturally, frequently used patterns persist
+- **Local optimization**: Each node optimizes its own edges (O(degree), not O(n))
+- **Self-regulating**: Decay adapts to local context, no global thresholds
 
 ### 7. Emergent Intelligence
 
@@ -234,6 +264,7 @@ Each level compounds: understanding at Level N multiplies understanding at Level
 - Wave follows highest transformed activation (intelligent routing)
 - Best decisions emerge from combined intelligence of nodes and edges
 - No hardcoded rules—decisions emerge from data and learned structure
+- Collects predictions from all activated nodes for output generation
 
 **Exploration Strategy**:
 - Uses existing edges to guide exploration (learned structure)
@@ -244,9 +275,16 @@ Each level compounds: understanding at Level N multiplies understanding at Level
 
 ### Largest Level: System-Level Intelligence Emerges
 
+**Hybrid Intelligence Architecture**:
+- **Wave Propagation (Thinking/Learning)**: Full graph context exploration, continuous learning, collects predictions from all activated nodes
+- **LLM-like Sampling (Output Generation)**: Probabilistic sampling from collected predictions, temperature-controlled creativity, autoregressive generation
+- Combines full-context intelligence with probabilistic creativity
+- Uses mini neural nets (nodes) and mini transformers (edges) throughout
+
 **Emergent Intelligence**:
 - Intelligence emerges from local interactions
 - No global algorithms—complexity emerges from simplicity
+- Dirty unconnected data → nodes → edges → blanks → hierarchy → intelligent output
 - System adapts to any data characteristics
 - Structure emerges from experience, not design
 - Knowledge compounds through hierarchies
@@ -562,12 +600,25 @@ void process_multiple_devices(MelvinMFile *mfile) {
    - If patterns immature: skip output (pure thinking mode)
    - No hardcoded threshold - relative to local measurements
 
-7. **Output Collection** (When Patterns Mature):
-   - Collect output from learned sequential continuations only
-   - Does NOT echo input - output is generated continuation, not repetition
-   - Output represents learned intent, not all contextual activations
-   - Follows co-activation edges (learned patterns)
-   - If no continuations found: no output generated (pure thinking mode)
+7. **Output Collection** (Hybrid Intelligence: Wave Propagation + LLM-like Sampling):
+   - **Phase 1 - Wave Propagation (Thinking/Learning)**:
+     - Wave explores entire graph simultaneously
+     - Nodes compute activation_strength (mini neural net predictions)
+     - Edges transform activation (mini transformer outputs)
+     - Creates/strengthens edges during exploration
+     - Forms hierarchies when patterns repeat
+     - Finds blank nodes that accept new patterns
+     - Collects predictions from ALL activated nodes
+   - **Phase 2 - LLM-like Sampling (Output Generation)**:
+     - Builds probability distribution from collected predictions
+     - Uses activation_strength as probability weights (mini neural nets)
+     - Uses edge_transform_activation() to shape probabilities (mini transformers)
+     - Probabilistic sampling (not deterministic) - can explore alternative paths
+     - Temperature-controlled creativity (adaptive, data-driven, range 0.5-1.5)
+     - Can echo input if activation is high (not restricted)
+     - Follows co-activation edges only (weight > local average)
+     - Autoregressive generation (step-by-step, like LLMs)
+   - Output combines full graph context intelligence with probabilistic creativity
 
 ### Node Operations
 
@@ -644,27 +695,51 @@ void process_multiple_devices(MelvinMFile *mfile) {
 - Self-regulating learning rate (from source node's adaptive rolling window)
 - Relative to local context
 - No global optimization
+- **Local edge decay**: Nodes optimize their outgoing edges during weight updates
+  - Activated edges: Strengthened (no decay)
+  - Non-activated edges: Decayed relative to local context
+  - Weaker edges decay faster (relative to local average)
+  - Strong edges (above local average) don't decay
+  - Decay rate computed from local edge weight distribution (no hardcoded thresholds)
+  - O(degree) operation - only iterates node's own edges, not O(n)
 
 ### Wave Propagation
 
 **How Waves Work**:
 - Start from initial nodes (matching input)
-- Propagate through edges
-- Activates nodes based on edge weights
+- Propagate through edges (explores entire graph simultaneously)
+- Activates nodes based on edge weights and transformations
 - Explores context around patterns
+- Collects predictions from all activated nodes (for output generation)
 - Continues until natural convergence
 
+**Intelligence in Wave Propagation**:
+- Nodes compute `activation_strength` (mini neural net predictions)
+- Edges transform activation (mini transformer outputs)
+- Wave follows highest transformed activation (intelligent routing)
+- Best decisions emerge from combined intelligence of nodes and edges
+- Creates/strengthens edges during exploration (continuous learning)
+- Forms hierarchies when patterns repeat
+- Finds blank nodes that accept new patterns
+
 **Exploration Strategy**:
-- Uses existing edges to guide exploration
-- Priority queues use learned structure
+- Uses existing edges to guide exploration (learned structure)
+- Priority queues use transformed activation strength
 - Similarity/context edges guide to relevant patterns
-- Adapts strategy based on what exists
+- Adapts strategy based on what exists locally
+- Intelligent exploration without global algorithms
 
 **Convergence**:
 - Natural energy dissipation
 - No hardcoded depth limits
 - Stops when propagation naturally weakens
-- Relative to initial energy
+- Relative to initial energy, not absolute
+
+**Output Collection During Wave Propagation**:
+- Collects `activation_strength` from all activated nodes
+- These predictions form the probability distribution for output generation
+- Full graph context used for intelligent predictions
+- Not limited to single path - sees entire activated graph
 
 ### Blank Nodes: Generalization Through Category Learning
 
@@ -816,11 +891,23 @@ void process_multiple_devices(MelvinMFile *mfile) {
 - Self-regulating: automatically saves after each adaptation
 - Persistent learning across sessions
 
+**Persistent Context and Cumulative Intelligence**:
+- **All edge weights persist**: When .m file loads, all nodes and edges are restored with their weights
+- **Cached sums reflect entire history**: `outgoing_weight_sum` and `incoming_weight_sum` include ALL past edge weights
+- **Context is cumulative**: Local context calculations use cached sums that reflect:
+  1. Past inputs (all previous interactions saved to .m file)
+  2. Past outputs (edges created from system's own generated outputs)
+  3. Current input (edges being created/strengthened right now)
+- **Intelligence accumulates**: Nodes with more history have higher context, making relative comparisons more meaningful
+- **No reset**: System never "forgets" - every interaction (input or output) becomes part of persistent context
+- **Outputs become knowledge**: When system generates output, those patterns are saved and affect future context calculations
+
 **Why This Matters**:
 - Programs that learn and improve
-- State persists naturally
-- Can resume learning where left off
-- Each .m file is a unique learning system
+- State persists naturally (including all edge weights that affect context)
+- Can resume learning where left off (context reflects entire history)
+- Each .m file is a unique learning system (context is unique to its learning history)
+- Intelligence compounds: More interactions → higher context → better relative comparisons → clearer paths
 
 ---
 
@@ -853,6 +940,8 @@ void process_multiple_devices(MelvinMFile *mfile) {
 - No train/test split
 - Learns from live data streams
 - No catastrophic forgetting
+- Local edge decay: Unused edges decay relative to local context
+- Intelligent forgetting: Weak edges decay faster, strong edges persist
 
 ### Self-Regulation
 
@@ -1033,6 +1122,114 @@ void process_multiple_devices(MelvinMFile *mfile) {
 - Each connection strengthens (learned structure compounds)
 - System gets faster at finding related patterns
 
+### Example 6: How Dirty Unconnected Data Becomes Intelligent
+
+**Initial State**: Empty graph (no nodes, no edges)
+
+**Input**: "cat" (dirty, unconnected data)
+
+**Step 1: Node Creation**:
+- `wave_process_sequential_patterns()` creates nodes: [c] [a] [t]
+- Nodes start isolated (no edges yet)
+- Each node is a mini neural net waiting for connections
+
+**Step 2: Co-Activation Edges**:
+- `wave_create_edges_from_coactivation()` creates sequential edges: [c] → [a] → [t]
+- Edges start weak, strengthen with repetition
+- Simple rule: nodes that activate together → edges
+
+**Step 3: Wave Propagation (Exploration & Learning)**:
+- Wave from [c] explores graph through edges
+- Finds similar patterns (if any) → creates similarity edges
+- Creates context edges (paths traveled together)
+- Updates weights based on activation
+- No learning yet, but structure forming
+
+**Step 4: Repetition Strengthens**:
+- Input "cat" again → matches existing nodes
+- Strengthens edges [c]→[a]→[t]
+- Edges get stronger with each repetition
+- Pattern becomes learned
+
+**Step 5: Hierarchy Formation**:
+- After many "cat" inputs:
+  - Edge [c]→[a] dominates local context
+  - Hierarchy node [ca] created (combines [c] + [a])
+  - Eventually: [cat] hierarchy node
+  - Can match "cat" in 1 step instead of 3
+  - Efficiency compounds with hierarchy depth
+
+**Step 6: Blank Node Generalization**:
+- Input "dog":
+  - Creates [d] [o] [g]
+  - Wave finds blank node (if similar patterns exist)
+  - Blank accepts → connects
+  - Category knowledge compounds: blank learns "3-letter animal" category
+
+**Step 7: Output Generation (Hybrid Intelligence)**:
+- Input "ca":
+  - **Wave Propagation Phase**:
+    - Explores full graph context
+    - Collects predictions from all activated nodes:
+      - [cat] (high activation - learned pattern)
+      - [car] (medium activation - similar)
+      - [can] (low activation - possible)
+  - **LLM-like Sampling Phase**:
+    - Builds probability distribution from collected predictions
+    - Uses `activation_strength` as weights (mini neural nets)
+    - Uses `edge_transform_activation()` to shape probabilities (mini transformers)
+    - Temperature = 0.7 (adaptive, creative)
+    - Samples probabilistically:
+      - Most likely: "cat" (high activation)
+      - Creative: "car" (medium activation)
+      - Possible: "can" (low activation)
+    - Output: "cat" (deterministic) or "car" (creative, probabilistic)
+
+**Result**: Dirty unconnected data → nodes → edges → blanks → hierarchy → intelligent output
+
+### Example 7: Hybrid Intelligence in Action
+
+**Input**: "hello"
+
+**Phase 1: Wave Propagation (Thinking/Learning)**:
+- Wave explores entire graph simultaneously
+- Nodes compute `activation_strength`:
+  - [h] → 0.9 (high - strong pattern)
+  - [e] → 0.8 (high - follows [h])
+  - [l] → 0.9 (high - repeated letter)
+- Edges transform activation:
+  - [h]→[e] transforms 0.9 → 0.95 (boosted by similarity)
+  - [e]→[l] transforms 0.8 → 0.85
+- Creates/strengthens edges during exploration
+- Forms hierarchy: [he] → [hel] → [hell] → [hello]
+- Finds blank nodes that accept new patterns
+- Collects predictions from ALL activated nodes
+
+**Phase 2: LLM-like Sampling (Output Generation)**:
+- Builds probability distribution from collected predictions:
+  ```
+  [hello] → 0.6 (high activation)
+  [help]  → 0.3 (medium activation)
+  [hell]  → 0.1 (low activation)
+  ```
+- Uses `edge_transform_activation()` to shape probabilities:
+  - Co-activation edges boost probabilities
+  - Similarity edges boost similar patterns
+  - Context edges boost related patterns
+- Temperature-controlled sampling:
+  - Temperature = 0.5 (deterministic) → outputs "hello"
+  - Temperature = 1.0 (balanced) → outputs "hello" or "help"
+  - Temperature = 1.5 (creative) → outputs "hello", "help", or "hell"
+- Autoregressive generation:
+  - Step 1: Sample "h"
+  - Step 2: Sample "e" (given "h")
+  - Step 3: Sample "l" (given "he")
+  - Step 4: Sample "l" (given "hel")
+  - Step 5: Sample "o" (given "hell")
+  - Output: "hello" (deterministic) or "help" (creative)
+
+**Result**: Full graph context intelligence + probabilistic creativity = intelligent, diverse output
+
 ---
 
 ## Detailed Mechanism Specifications
@@ -1200,11 +1397,21 @@ void process_multiple_devices(MelvinMFile *mfile) {
   - If `output_readiness > 0.0f`: patterns exist → collect output
   - If `output_readiness == 0.0f`: no patterns → pure thinking (no output to ports)
   
-- **Output Collection**: Only learned sequential continuations
-  - Starts from last input node (input nodes marked as visited context)
-  - Follows co-activation edges (learned patterns)
-  - Extends output based on relative confidence thresholds
-  - Does NOT include input nodes (no echoing)
+- **Output Collection**: Hybrid intelligence (Wave Propagation + LLM-like Sampling)
+  - **Wave Propagation Phase**: Collects predictions from all activated nodes
+    - Full graph context exploration
+    - Nodes compute activation_strength (mini neural net predictions)
+    - Edges transform activation (mini transformer outputs)
+    - Creates/strengthens edges, forms hierarchies, finds blank nodes
+  - **LLM-like Sampling Phase**: Generates output probabilistically
+    - Builds probability distribution from collected predictions
+    - Uses activation_strength as weights (mini neural nets)
+    - Uses edge_transform_activation() for probability shaping (mini transformers)
+    - Temperature-controlled sampling (adaptive, 0.5-1.5 range)
+    - Can echo input if activation is high (probabilistic, not restricted)
+    - Follows co-activation edges only (weight > local average)
+    - Autoregressive generation (step-by-step)
+  - Output combines full-context intelligence with probabilistic creativity
   - Output is raw data bytes (no port_id in output)
   
 - **Output Routing**: External port manager handles routing
@@ -1233,11 +1440,56 @@ void process_multiple_devices(MelvinMFile *mfile) {
 - Cached sums maintained incrementally when edges change
 - No histogram building or percentile computation needed
 
+**Context is Cumulative: Persistent + Current + Outputs**:
+- **Persistent Weights (from .m file)**: When nodes load from .m file, all edge weights are restored
+  - Cached sums (`outgoing_weight_sum`, `incoming_weight_sum`) reflect ALL past edge weights
+  - These persistent weights affect local context calculations from the moment the graph loads
+  - Example: "hello" node with 1000 past inputs → `outgoing_weight_sum = 45.0` → `local_avg = 0.9` (HIGH context)
+- **Current Input (temporary activation)**: New edges created/strengthened during current processing
+  - Cached sums updated incrementally: `node_update_outgoing_weight_sum(node, old_weight, new_weight)`
+  - Happens in real-time during wave propagation
+  - Example: "hello" input now → edge strengthens `0.7 → 0.8` → `outgoing_weight_sum = 45.1` → context changes
+- **Previous Outputs (become part of graph)**: When system generates output, nodes/edges are created and saved to .m
+  - These edges persist and affect future context calculations
+  - System's own outputs become part of its persistent context
+  - Example: System outputs "hello world" → creates `[hello]→[world]` edge → saved → affects future context
+- **Total Context = Persistent (past) + Current (now) + Outputs (system-generated)**
+  - Context reflects entire learning history, not just current input
+  - Nodes with history have higher context than brand new nodes
+  - This makes relative comparisons (`edge_relative = edge->weight / local_avg`) meaningful and adaptive
+
+**Example: Context Difference Between Experienced vs New Nodes**:
+```
+Node "hello" (1000 past inputs, in .m file):
+  - Persistent: outgoing_weight_sum = 45.0 (from past)
+  - Current: +0.1 (current input strengthens edge)
+  - Outputs: +0.7 (previous "hello world" output)
+  - Total: outgoing_weight_sum = 45.8, outgoing_count = 52
+  - local_outgoing_avg = 45.8 / 52 = 0.88 (HIGH context)
+  - Edge weight 0.8: edge_relative = 0.8 / 0.88 = 0.91 (moderate relative to high context)
+
+Node "xyzzy" (brand new, never seen):
+  - Persistent: outgoing_weight_sum = 0.0 (no past)
+  - Current: +0.1 (new edge created)
+  - Outputs: 0.0 (no previous outputs)
+  - Total: outgoing_weight_sum = 0.1, outgoing_count = 1
+  - local_outgoing_avg = 0.1 / 1 = 0.1 (LOW context)
+  - Edge weight 0.8: edge_relative = 0.8 / 0.1 = 8.0 (VERY STRONG relative to low context)
+```
+
+**Why This Matters for Intelligence**:
+- Context reflects cumulative learning: nodes that have been used more have higher context
+- Previous outputs shape future context: system's own generated patterns become part of its knowledge
+- Relative comparisons are meaningful: same edge weight means different things depending on node's history
+- Intelligence accumulates: each interaction (input or output) affects cached sums, which persist in .m file
+- System remembers everything: no distinction between "training" and "inference" - all experience accumulates
+
 **Edge Type Detection**:
 - Similarity edges: weight between 50%-150% of local average
 - Co-activation edges: weight above local average
 - All comparisons relative to node's local context, not global percentiles
 - More context-aware and adaptive to each node's neighborhood
+- Context includes persistent weights from .m file, making comparisons reflect entire learning history
 
 ### Adaptive Learning Rates
 
@@ -1379,6 +1631,25 @@ void process_multiple_devices(MelvinMFile *mfile) {
 - Constant per-node cost
 - Scales to billions of nodes efficiently
 
+**Performance Optimizations (All Data-Driven)**:
+- **Early Exit on Exact Matches**: Skips similarity calculations when exact match found (no hardcoded threshold)
+- **Lazy Connection Matching**: Only computes connection match when direct match insufficient (threshold adapts to local context)
+- **Early Exit in Byte Comparisons**: Stops comparing when mismatch rate exceeds adaptive threshold (computed from node characteristics)
+- **Cached Local Weight Averages**: O(1) access to cached averages, invalidated when edges change (no global state)
+- **Skip Wave Exploration on Fast Path**: Skips expensive wave exploration when exact match found in fast paths (no limits)
+- **O(n log n) Priority Sorting**: Replaced O(n²) insertion sort with quicksort, adaptive candidate limiting based on priority variance (no hardcoded limits)
+- **Edge Lookup Cache**: Per-node cache for recent edge lookups (local-only, no global state)
+- **Adaptive Connection Matching**: Only checks top edges by weight, limit computed from weight distribution (no hardcoded limit)
+
+**CPU Optimizations (Hardware-Aware)**:
+- **Optimized Compiler Flags**: `-O3 -march=native -mtune=native` enables auto-vectorization and CPU-specific optimizations
+- **SIMD Vectorization**: SSE2 (x86) and NEON (ARM/Jetson) for 16-byte-at-once comparisons (4-8x speedup)
+- **Memory Alignment**: 16-byte aligned node allocations for optimal SIMD performance
+- **Auto-Vectorization**: Compiler automatically vectorizes loops with `-ftree-vectorize` and `-O3`
+- **Link-Time Optimization**: `-flto` enables cross-module optimizations
+
+All optimizations preserve intelligent decision-making: compounding learning, adaptive behavior, local-only operations, and data-driven thresholds. CPU optimizations are hardware-aware and automatically adapt to available SIMD instructions (SSE2 on x86, NEON on ARM/Jetson).
+
 ### Space Complexity
 
 **Nodes**: O(n) where n = number of nodes
@@ -1458,5 +1729,15 @@ void process_multiple_devices(MelvinMFile *mfile) {
 
 ✅ **Self-Regulating**: System adapts through local feedback loops without global state
 
-The implementation now fully matches the vision: **local measurements only**, **no global state**, **data-driven adaptation**.
+✅ **Performance Optimizations**: All optimizations are data-driven and adaptive, preserving intelligent decision-making:
+   - Early exit on exact matches (skips similarity calculations)
+   - Lazy connection matching (only when direct match insufficient)
+   - Early exit in byte comparisons (adaptive mismatch threshold)
+   - Cached local weight averages (O(1) access, invalidated when edges change)
+   - Skip wave exploration when fast path succeeds (exact match found)
+   - O(n log n) priority sorting instead of O(n²) (adaptive candidate limiting)
+   - Edge lookup cache (local-only, per-node)
+   - Adaptive connection matching (top edges by weight, limit computed from distribution)
+
+The implementation now fully matches the vision: **local measurements only**, **no global state**, **data-driven adaptation**, **optimized operations per byte**.
 
