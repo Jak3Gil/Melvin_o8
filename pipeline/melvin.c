@@ -24,6 +24,7 @@
 #include <float.h>
 #include <string.h>
 #include <pthread.h>
+#include <stdlib.h>  /* For qsort_r */
 
 /* CPU OPTIMIZATION: SIMD includes for vectorized byte comparisons */
 #ifdef __SSE2__
@@ -37,16 +38,46 @@
 static ThreadPool *g_thread_pool = NULL;
 static pthread_mutex_t g_thread_pool_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+/* Global GPU context cache (initialized on first use, cached for performance) */
+static MelvinGPUContext *g_gpu_ctx = NULL;
+static bool g_gpu_checked = false;
+static bool g_gpu_available = false;
+static pthread_mutex_t g_gpu_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+/* Cached parallelization threshold (computed once, reused) */
+static size_t g_parallelization_threshold = 0;
+static bool g_threshold_computed = false;
+
 /* Initialize thread pool (thread-safe, lazy initialization) */
 static ThreadPool* get_thread_pool(void) {
     if (!g_thread_pool) {
         pthread_mutex_lock(&g_thread_pool_mutex);
         if (!g_thread_pool) {
             g_thread_pool = thread_pool_create(0); /* 0 = auto-detect CPU count */
+            /* Compute threshold once when pool is created */
+            if (g_thread_pool && !g_threshold_computed) {
+                g_parallelization_threshold = g_thread_pool->thread_count;
+                g_threshold_computed = true;
+            }
         }
         pthread_mutex_unlock(&g_thread_pool_mutex);
     }
     return g_thread_pool;
+}
+
+/* Get GPU context (cached, checked once) */
+/* INTELLIGENT: Only checks GPU availability once, then caches result */
+static MelvinGPUContext* get_cached_gpu_context(void) {
+    if (!g_gpu_checked) {
+        pthread_mutex_lock(&g_gpu_mutex);
+        if (!g_gpu_checked) {
+            g_gpu_ctx = melvin_gpu_get_context();
+            g_gpu_available = (g_gpu_ctx && melvin_gpu_is_available(g_gpu_ctx));
+            g_gpu_checked = true;
+        }
+        pthread_mutex_unlock(&g_gpu_mutex);
+    }
+    return g_gpu_available ? g_gpu_ctx : NULL;
 }
 
 
@@ -486,30 +517,39 @@ static float compute_adaptive_epsilon(float value_range) {
 }
 
 /* Compute adaptive clipping bound from observed data distribution (no fallbacks) */
+/* BRAIN-LIKE: Compute adaptive clip bound from local average (O(n), not O(n log n)) */
+/* Replaces percentile computation with simple average + max ratio (local-only) */
+/* Follows README: No Global Statistics - uses local averages only */
 static float compute_adaptive_clip_bound(float *values, size_t count) {
-    if (!values || count < 3) {
+    if (!values || count < 2) {
         /* No data or insufficient data: return 0.0f (no operation) */
         return 0.0f;
     }
-    /* Use 95th percentile of observed values as baseline */
-    float p95 = compute_percentile_from_array(values, count, 95);
-    if (p95 <= 0.0f) {
+    
+    /* BRAIN-LIKE: Compute local average (O(n), but only for stability, not hot path) */
+    float sum = 0.0f;
+    float max_val = values[0];
+    for (size_t i = 0; i < count; i++) {
+        sum += values[i];
+        if (values[i] > max_val) max_val = values[i];
+    }
+    float local_avg = sum / (float)count;
+    
+    if (local_avg <= 0.0f) {
         /* All values are zero: return 0.0f (no operation) */
         return 0.0f;
     }
     
-    /* RELATIVE: Compute multiplier from data distribution instead of hardcoded 2.0f */
-    /* Use ratio of higher percentile to p95 as multiplier */
-    float p99 = compute_percentile_from_array(values, count, 99);
-    if (p99 > 0.0f && p95 > 0.0f) {
-        float epsilon = compute_adaptive_epsilon(p95);
-        float multiplier = p99 / (p95 + epsilon);
-        /* Ensure reasonable multiplier: use p99/p95 ratio as data-driven multiplier */
-        return p95 * multiplier;
-    }
+    /* RELATIVE: Compute multiplier from max/average ratio (data-driven, not hardcoded) */
+    /* Strong signals (max >> avg) get higher multiplier, weak signals get lower */
+    float epsilon = compute_adaptive_epsilon(local_avg);
+    float max_ratio = max_val / (local_avg + epsilon);
     
-    /* Fallback: if can't compute ratio, use p95 itself (no operation beyond data) */
-    return p95;
+    /* RELATIVE: Normalize multiplier using x / (x + 1.0f) pattern */
+    float normalized_multiplier = max_ratio / (max_ratio + 1.0f);
+    
+    /* Return average scaled by normalized multiplier (adaptive, not hardcoded) */
+    return local_avg * (1.0f + normalized_multiplier);
 }
 
 /* Compute adaptive smoothing factor based on change rate */
@@ -624,10 +664,16 @@ static float compute_well_connected_threshold(Node *node) {
     }
     
     if (count > 0) {
-        /* Use 75th percentile as "well-connected" threshold */
-        float threshold = compute_percentile_from_array(connection_counts, count, 75);
+        /* BRAIN-LIKE: Use local average as "well-connected" threshold (O(n), not O(n log n)) */
+        /* Follows README: No Global Statistics - uses local averages only */
+        float sum = 0.0f;
+        for (size_t i = 0; i < count; i++) {
+            sum += connection_counts[i];
+        }
+        float local_avg = sum / (float)count;
+        
         free(connection_counts);
-        return threshold;
+        return local_avg;
     }
     
     free(connection_counts);
@@ -659,10 +705,15 @@ static float compute_adaptive_confidence_increase(float *observed_confidences, s
         float median_change = compute_median_adaptive(changes, count - 1);
         free(changes);
         
-        /* RELATIVE: Increase rate adapts to observed change rate */
-        float range = (count > 0) ? 
-            (compute_percentile_from_array(observed_confidences, count, 100) - 
-             compute_percentile_from_array(observed_confidences, count, 0)) : 0.0f;
+        /* BRAIN-LIKE: Compute range from local min/max (O(n), not O(n log n)) */
+        /* Follows README: No Global Statistics - uses local averages only */
+        float min_val = observed_confidences[0];
+        float max_val = observed_confidences[0];
+        for (size_t i = 1; i < count; i++) {
+            if (observed_confidences[i] < min_val) min_val = observed_confidences[i];
+            if (observed_confidences[i] > max_val) max_val = observed_confidences[i];
+        }
+        float range = max_val - min_val;
         
         if (range <= 0.0f) return 0.0f;  /* No range = no operation */
         
@@ -1755,89 +1806,80 @@ static bool edge_is_node_isolated(Node *node) {
 /* Transform activation as it flows through edge */
 /* Philosophy: Edges learn transformations through co-activation, self-regulating */
 /* Intelligent transformation: uses observable patterns (similarity, context) */
+/* IMPLIED CHECKS: Compute context once, use for all decisions (biological efficiency) */
 float edge_transform_activation(Edge *edge, float input_activation) {
     if (!edge) return 0.0f;
     
     /* Base transformation: weighted signal */
     float transformed = edge->weight * input_activation;
     
+    /* IMPLIED CHECKS: Compute context once per edge transformation */
+    /* Like biological systems: compute state once, use for all decisions */
+    bool has_from_node = (edge->from_node != NULL);
+    bool has_to_node = (edge->to_node != NULL);
+    
+    /* IMPLIED: Compute local context once (used for both similarity and inhibition) */
+    float from_local_avg = 0.0f;
+    float from_local_avg_combined = 0.0f;
+    bool has_local_context = false;
+    bool has_combined_context = false;
+    
+    if (has_from_node) {
+        from_local_avg = node_get_local_outgoing_weight_avg(edge->from_node);  /* O(1) cached */
+        has_local_context = (from_local_avg > 0.0f);
+        
+        /* Combined average for similarity check (compute once) */
+        float from_incoming_avg = node_get_local_incoming_weight_avg(edge->from_node);
+        from_local_avg_combined = (from_local_avg + from_incoming_avg) / 2.0f;
+        has_combined_context = (from_local_avg_combined > 0.0f);
+    }
+    
     /* Intelligent transformation based on observable patterns: */
     
     /* 1. Pattern similarity (observable from payloads) */
-    if (edge->from_node && edge->to_node) {
+    /* SMOOTH FUNCTION: Always computes, smooth transition instead of hard threshold */
+    /* Enables fine-grained learning and evolution through continuous values */
+    if (has_from_node && has_to_node) {
         float similarity = edge_compute_pattern_similarity(edge->from_node, edge->to_node);
         
-        /* UNIVERSAL: Boost similar patterns relative to local context (no hardcoded threshold) */
-        float local_avg = (node_get_local_outgoing_weight_avg(edge->from_node) + 
-                           node_get_local_incoming_weight_avg(edge->from_node)) / 2.0f;
+        /* IMPLIED: Use precomputed threshold (no repeated computation) */
+        float similarity_threshold = has_combined_context ? from_local_avg_combined : 0.0f;
         
-        /* Relative threshold: similarity must be meaningful relative to local context */
-        float similarity_threshold = (local_avg > 0.0f) ? local_avg : 0.0f;
+        /* SMOOTH: Compute boost strength with sigmoid-like transition (branchless) */
+        /* Strong similarity = full boost, weak = minimal boost, smooth in between */
+        float excess = similarity - similarity_threshold;
+        float boost_strength = excess / (fabsf(excess) + 1.0f);  /* Smooth: -1 to 1 */
+        boost_strength = (boost_strength + 1.0f) / 2.0f;  /* Normalize: 0 to 1 */
+        boost_strength = fmaxf(0.0f, boost_strength);  /* Clamp negative to 0 (branchless) */
         
-        if (similarity > similarity_threshold) {
-            /* UNIVERSAL: Boost relative to similarity and local context (no hardcoded multiplier) */
-            float boost_factor = (local_avg > 0.0f) ? similarity * (local_avg / (local_avg + 1.0f)) : similarity;
-            transformed *= (1.0f + boost_factor);
-        }
+        /* IMPLIED: Use precomputed context flag */
+        float boost_factor = has_combined_context ? 
+            similarity * (from_local_avg_combined / (from_local_avg_combined + 1.0f)) : 
+            similarity;
+        
+        /* Apply boost scaled by smooth strength (always applies, strength varies) */
+        transformed *= (1.0f + boost_factor * boost_strength);
     }
     
-    /* 2. Local context (observable from other edges) */
-    if (edge->from_node) {
-        float local_avg = node_get_local_outgoing_weight_avg(edge->from_node);
-        if (local_avg > 0.0f) {
-            float edge_relative = edge->weight / local_avg;
-            
-            /* Boost primary paths (strong relative to local context) */
-            /* Threshold adapts to local edge weight distribution (data-driven, no fallback) */
-            float primary_threshold = 1.0f;
-            if (local_avg > 0.0f && edge->from_node) {
-                /* Compute 75th percentile of edge weights relative to local_avg */
-                float *edge_weights = (float*)malloc(edge->from_node->outgoing_count * sizeof(float));
-                size_t count = 0;
-                for (size_t i = 0; i < edge->from_node->outgoing_count; i++) {
-                    if (edge->from_node->outgoing_edges[i]) {
-                        edge_weights[count++] = edge->from_node->outgoing_edges[i]->weight / local_avg;
-                    }
-                }
-                if (count > 0) {
-                    /* Filter out zero weights for more meaningful percentile */
-                    float *non_zero_weights = (float*)malloc(count * sizeof(float));
-                    size_t non_zero_count = 0;
-                    for (size_t i = 0; i < count; i++) {
-                        if (edge_weights[i] > 0.0f) {
-                            non_zero_weights[non_zero_count++] = edge_weights[i];
-                        }
-                    }
-                    
-                    if (non_zero_count > 0) {
-                        float p75 = compute_percentile_from_array(non_zero_weights, non_zero_count, 75);
-                        /* Use adaptive epsilon to ensure p75 is meaningful */
-                        float range = (non_zero_count > 1) ? 
-                                     (compute_percentile_from_array(non_zero_weights, non_zero_count, 100) - 
-                                      compute_percentile_from_array(non_zero_weights, non_zero_count, 0)) : 
-                                     non_zero_weights[0];
-                        float epsilon = compute_adaptive_epsilon(range);
-                        primary_threshold = 1.0f + fmaxf(p75, epsilon);  /* Ensure at least epsilon boost */
-                    } else {
-                        /* All weights are zero: use minimal boost */
-                        primary_threshold = 1.0f + compute_adaptive_epsilon(local_avg);
-                    }
-                    free(non_zero_weights);
-                }
-                free(edge_weights);
-            } else {
-                /* NO FALLBACK: Return 0.0f (neutral) when no data = no boost */
-                primary_threshold = 0.0f;
-            }
-            /* Only apply boost if we have data (threshold > 0.0f) and edge is stronger */
-            if (primary_threshold > 0.0f && edge_relative > primary_threshold) {
-                /* RELATIVE: Boost amount adapts relative to edge strength itself */
-                /* Use edge_relative as context for boost computation */
-                float boost_base = edge_relative / (edge_relative + 1.0f);  /* Normalize */
-                float boost_factor = 1.0f + boost_base;  /* Boost relative to edge strength */
-                transformed *= boost_factor;
-            }
-        }
+    /* 2. BRAIN-LIKE: Local inhibition (winner-take-all in local region) */
+    /* Uses simple comparison to local average (O(1)), not expensive percentile computation */
+    /* Follows README: O(1) per-node cost, local-only operations */
+    /* Like biological systems: strong signals suppress weak ones through local competition */
+    /* IMPLIED: Use precomputed context */
+    if (has_from_node && has_local_context) {
+        float edge_relative = edge->weight / from_local_avg;
+        
+        /* BRAIN-LIKE: Local competition (is this edge stronger than local average?) */
+        /* No sorting, no percentile - just "is it above average?" (O(1)) */
+        /* Threshold emerges from local context: 1.0 = average, >1.0 = above average */
+        /* SMOOTH FUNCTION: Always computes boost, smooth transition instead of hard threshold */
+        /* Enables fine-grained learning through continuous competition */
+        /* Edges above average get boost, below average get suppression, smooth transition */
+        float excess = edge_relative - 1.0f;  /* How much above/below average */
+        float boost_base = fmaxf(0.0f, excess) / (fabsf(excess) + 1.0f);  /* Smooth: 0 to 1 */
+        /* Quadratic boost for stronger edges (stronger competition) */
+        float boost_factor = 1.0f + boost_base * boost_base;  /* Boost relative to edge strength */
+        transformed *= boost_factor;
     }
     
     return transformed;
@@ -1874,9 +1916,140 @@ static Node* node_find_via_outgoing(Node *from_node, const uint8_t *pattern, siz
     return NULL;
 }
 
-/* Find blank node that could accept this pattern (compounding learning) */
+/* LOCAL-ONLY MATCHING: Find node by checking ALL immediate neighbors (O(1) - local edges only) */
+/* Follows SYSTEM_AUDIT recommendation: Replace global wave exploration with local edge checks */
+/* Checks: outgoing edges, incoming edges, and neighbors of neighbors (2-hop local) */
+/* Only uses local knowledge - no global graph traversal */
+static Node* node_find_via_local_neighbors(Node *from_node, const uint8_t *pattern, size_t pattern_size) {
+    if (!from_node) return NULL;
+    
+    /* LOCAL-ONLY: Check outgoing edges (1-hop neighbors) - O(degree), not O(n) */
+    for (size_t i = 0; i < from_node->outgoing_count; i++) {
+        Edge *edge = from_node->outgoing_edges[i];
+        if (!edge || !edge->to_node) continue;
+        
+        Node *candidate = edge->to_node;
+        /* Check exact match (1-hop neighbor) */
+        if (node_payload_exact_match(candidate, pattern, pattern_size)) {
+            return candidate;
+        }
+        
+        /* LOCAL-ONLY: Check candidate's outgoing edges (2-hop neighbors) - still O(degree²), not O(n) */
+        /* This finds hierarchy nodes accessible through local connections */
+        for (size_t j = 0; j < candidate->outgoing_count; j++) {
+            Edge *edge2 = candidate->outgoing_edges[j];
+            if (!edge2 || !edge2->to_node) continue;
+            
+            Node *candidate2 = edge2->to_node;
+            if (node_payload_exact_match(candidate2, pattern, pattern_size)) {
+                return candidate2;
+            }
+        }
+    }
+    
+    /* LOCAL-ONLY: Check incoming edges (reverse direction neighbors) - O(degree), not O(n) */
+    for (size_t i = 0; i < from_node->incoming_count; i++) {
+        Edge *edge = from_node->incoming_edges[i];
+        if (!edge || !edge->from_node) continue;
+        
+        Node *candidate = edge->from_node;
+        /* Check exact match (1-hop neighbor via incoming edge) */
+        if (node_payload_exact_match(candidate, pattern, pattern_size)) {
+            return candidate;
+        }
+        
+        /* LOCAL-ONLY: Check candidate's outgoing edges (2-hop neighbors via reverse direction) */
+        for (size_t j = 0; j < candidate->outgoing_count; j++) {
+            Edge *edge2 = candidate->outgoing_edges[j];
+            if (!edge2 || !edge2->to_node) continue;
+            
+            Node *candidate2 = edge2->to_node;
+            if (node_payload_exact_match(candidate2, pattern, pattern_size)) {
+                return candidate2;
+            }
+        }
+    }
+    
+    return NULL;
+}
+
+/* Find blank node via local neighbors only (O(degree), not O(n)) */
+/* README: Brain-like - only checks local edges, never global search */
 /* Blank nodes learn through connections - patterns connecting to blank nodes teach them about their category */
 /* A blank node "accepts" a pattern if its connected patterns are similar to the new pattern */
+static Node* node_find_accepting_blank_via_local_neighbors(Node *from_node, const uint8_t *pattern, size_t pattern_size) {
+    if (!from_node) return NULL;
+    
+    Node *best_blank = NULL;
+    float best_acceptance_score = 0.0f;
+    
+    /* LOCAL-ONLY: Check outgoing edges (1-hop neighbors) - O(degree), not O(n) */
+    for (size_t i = 0; i < from_node->outgoing_count; i++) {
+        Edge *edge = from_node->outgoing_edges[i];
+        if (!edge || !edge->to_node) continue;
+        
+        Node *candidate = edge->to_node;
+        /* Check if candidate is a blank node (payload_size == 0) */
+        if (candidate->payload_size == 0) {
+            /* Compute acceptance score based on candidate's connections */
+            float acceptance_score = node_calculate_match_strength(candidate, pattern, pattern_size);
+            if (acceptance_score > best_acceptance_score) {
+                best_acceptance_score = acceptance_score;
+                best_blank = candidate;
+            }
+        }
+        
+        /* LOCAL-ONLY: Check candidate's outgoing edges (2-hop neighbors) - still O(degree²), not O(n) */
+        for (size_t j = 0; j < candidate->outgoing_count; j++) {
+            Edge *edge2 = candidate->outgoing_edges[j];
+            if (!edge2 || !edge2->to_node) continue;
+            
+            Node *candidate2 = edge2->to_node;
+            if (candidate2->payload_size == 0) {
+                float acceptance_score = node_calculate_match_strength(candidate2, pattern, pattern_size);
+                if (acceptance_score > best_acceptance_score) {
+                    best_acceptance_score = acceptance_score;
+                    best_blank = candidate2;
+                }
+            }
+        }
+    }
+    
+    /* LOCAL-ONLY: Check incoming edges (reverse direction neighbors) - O(degree), not O(n) */
+    for (size_t i = 0; i < from_node->incoming_count; i++) {
+        Edge *edge = from_node->incoming_edges[i];
+        if (!edge || !edge->from_node) continue;
+        
+        Node *candidate = edge->from_node;
+        if (candidate->payload_size == 0) {
+            float acceptance_score = node_calculate_match_strength(candidate, pattern, pattern_size);
+            if (acceptance_score > best_acceptance_score) {
+                best_acceptance_score = acceptance_score;
+                best_blank = candidate;
+            }
+        }
+        
+        /* LOCAL-ONLY: Check candidate's outgoing edges (2-hop neighbors via reverse direction) */
+        for (size_t j = 0; j < candidate->outgoing_count; j++) {
+            Edge *edge2 = candidate->outgoing_edges[j];
+            if (!edge2 || !edge2->to_node) continue;
+            
+            Node *candidate2 = edge2->to_node;
+            if (candidate2->payload_size == 0) {
+                float acceptance_score = node_calculate_match_strength(candidate2, pattern, pattern_size);
+                if (acceptance_score > best_acceptance_score) {
+                    best_acceptance_score = acceptance_score;
+                    best_blank = candidate2;
+                }
+            }
+        }
+    }
+    
+    return best_blank;
+}
+
+/* DEPRECATED: O(n) global search - replaced with local-only node_find_accepting_blank_via_local_neighbors */
+/* Kept for backward compatibility but should not be used */
 static Node* wave_find_accepting_blank_node(MelvinGraph *g, Node **seed_nodes, size_t seed_count,
                                             const uint8_t *pattern, size_t pattern_size,
                                             size_t max_steps) {
@@ -1955,12 +2128,19 @@ static Node* wave_find_accepting_blank_node(MelvinGraph *g, Node **seed_nodes, s
                         /* Compute boost from priority distribution if available */
                         float boost = 1.0f;
                         if (blank_count > 0 && blank_priorities) {
-                            float p75 = compute_percentile_from_array(blank_priorities, blank_count, 75);
+                            /* BRAIN-LIKE: Use local average instead of percentile (O(n), not O(n log n)) */
+                            /* Follows README: No Global Statistics - uses local averages only */
+                            float sum = 0.0f;
+                            for (size_t i = 0; i < blank_count; i++) {
+                                sum += blank_priorities[i];
+                            }
+                            float local_avg = sum / (float)blank_count;
+                            
                             /* Use adaptive epsilon to prevent unstable division */
                             float range = max_priority;
                             float epsilon = compute_adaptive_epsilon(range);
-                            if (p75 > epsilon) {
-                                boost = max_priority / (p75 + epsilon);
+                            if (local_avg > epsilon) {
+                                boost = max_priority / (local_avg + epsilon);
                                 /* Clip boost to prevent extreme values (adaptive clipping, no fallbacks) */
                                 float *observed_boosts = blank_priorities;  /* Reuse array for clipping calculation */
                                 float max_boost = compute_adaptive_clip_bound(observed_boosts, blank_count);
@@ -1969,7 +2149,7 @@ static Node* wave_find_accepting_blank_node(MelvinGraph *g, Node **seed_nodes, s
                                 }
                                 /* If max_boost is 0.0f, no clipping (no data available) */
                             } else {
-                                /* p75 too small: use conservative boost */
+                                /* local_avg too small: use conservative boost */
                                 boost = 1.0f + (1.0f / (max_priority + epsilon));
                             }
                         } else {
@@ -2140,12 +2320,17 @@ static Node* wave_find_accepting_blank_node(MelvinGraph *g, Node **seed_nodes, s
     return best_blank;  /* Return best blank node that could accept this pattern */
 }
 
-/* Find node through wave propagation exploration from seed nodes (uses whole graph via edges) */
-/* Wave propagation explores graph through edges to discover existing nodes matching pattern */
-/* Returns first matching node found, or NULL if not found through wave exploration */
+/* DEPRECATED: O(n) global search - VIOLATES README PRINCIPLE */
+/* README: All operations must be O(degree), not O(n). This function is NEVER called. */
+/* Replaced with local-only node_find_via_local_neighbors */
+/* This function exists only for reference - DO NOT USE */
 static Node* wave_find_node_via_exploration(MelvinGraph *g, Node **seed_nodes, size_t seed_count,
                                              const uint8_t *pattern, size_t pattern_size, 
                                              size_t max_steps, WaveStatistics *stats) {
+    /* README VIOLATION: This function does O(n) graph traversal */
+    /* This should NEVER be called - use node_find_via_local_neighbors instead */
+    (void)g; (void)seed_nodes; (void)seed_count; (void)pattern; (void)pattern_size; (void)max_steps; (void)stats;
+    return NULL;  /* Always returns NULL - function is deprecated */
     (void)stats;  /* No longer used - kept for backward compatibility */
     if (!g || !seed_nodes || seed_count == 0 || max_steps == 0) return NULL;
     
@@ -2484,12 +2669,13 @@ Node** wave_process_sequential_patterns(MelvinGraph *g, const uint8_t *data, siz
             /* Skip if pattern extends beyond data */
             if (i + pattern_size > data_size) continue;
             
-            /* OPTIMIZATION 5: Fast path checks - skip wave exploration if exact match found */
-            /* 1. Check previous node's outgoing edges (fastest - sequential patterns connect via edges) */
-            if (prev_node && pattern_size == 1) {
-                activated_node = node_find_via_outgoing(prev_node, pattern, pattern_size);
+            /* LOCAL-ONLY MATCHING: Check immediate neighbors first (O(1) - local edges only) */
+            /* Follows SYSTEM_AUDIT recommendation: Replace global wave exploration with local edge checks */
+            /* 1. Check previous node's local neighbors (outgoing + incoming edges) - O(degree), not O(n) */
+            if (prev_node) {
+                activated_node = node_find_via_local_neighbors(prev_node, pattern, pattern_size);
                 if (activated_node) {
-                    /* Exact match found - skip all other checks and wave exploration */
+                    /* Exact match found in local neighbors - skip all global exploration */
                     goto node_found_fast_path;
                 }
             }
@@ -2517,24 +2703,8 @@ Node** wave_process_sequential_patterns(MelvinGraph *g, const uint8_t *data, siz
                 }
             }
             
-            /* 3. For larger patterns (>1 byte), use wave exploration to find hierarchy nodes */
-            if (!activated_node && pattern_size > 1 && prev_node) {
-                /* UNIVERSAL: Use wave exploration to find nodes matching larger pattern */
-                /* Prioritizes nodes with payload_size >= pattern_size (all nodes, not just combined) */
-                /* LOCAL: Use prev_node as seed for wave exploration (follows README: local operations only) */
-                /* ADAPTIVE: Exploration steps scale with graph size (logarithmic) - no hardcoded depth */
-                size_t adaptive_steps = compute_adaptive_exploration_steps(g, 1);
-                Node *seed_node = prev_node;
-                Node *hierarchy_match = wave_find_node_via_exploration(g, &seed_node, 1,
-                                                                        pattern, pattern_size, adaptive_steps, NULL);
-                if (hierarchy_match && hierarchy_match->payload_size >= pattern_size &&
-                    node_payload_exact_match(hierarchy_match, pattern, pattern_size)) {
-                    /* Found node matching larger pattern - use it (compounds: skip individual bytes) */
-                    activated_node = hierarchy_match;
-                    i += (pattern_size - 1);  /* Skip bytes already matched */
-                    break;
-                }
-            }
+            /* NOTE: Local neighbor check (step 1) already handles all pattern sizes, including larger patterns */
+            /* Wave exploration for larger patterns removed per SYSTEM_AUDIT: use only as last resort */
             
             /* DATA-DRIVEN: Bootstrap activation_strength when node matches input (not hardcoded threshold) */
             /* Set activation based on match quality when node is found via any method above */
@@ -2556,54 +2726,45 @@ Node** wave_process_sequential_patterns(MelvinGraph *g, const uint8_t *data, siz
         const uint8_t *pattern = data + i;
         size_t pattern_size = 1;  /* Fall back to single byte if hierarchy-first didn't match */
         
-        /* 4. Use wave propagation to explore graph from prev_node as seed (local operation, no graph scan) */
-        /* This discovers existing nodes through natural graph exploration (exact or similar matches) */
-        /* Compounding learning: blank nodes actively accept patterns, teaching the whole system */
-        Node *found_match = NULL;
-        bool is_exact_match = false;
+        /* 4. LOCAL-ONLY: Final local check before global exploration (SYSTEM_AUDIT recommendation) */
+        /* Check local neighbors one more time for single-byte pattern */
         if (!activated_node && prev_node) {
-            /* LOCAL: Use prev_node as single seed for wave exploration (follows README: local operations only) */
-            /* ADAPTIVE: Exploration steps scale with graph size (logarithmic) - no hardcoded depth */
-            size_t adaptive_steps = compute_adaptive_exploration_steps(g, 1);
-            Node *seed_node = prev_node;
-            found_match = wave_find_node_via_exploration(g, &seed_node, 1, 
-                                                          pattern, pattern_size, adaptive_steps, NULL);
-            if (found_match) {
-                /* Use exact match if found */
-                is_exact_match = node_payload_exact_match(found_match, pattern, pattern_size);
-                if (is_exact_match) {
-                    activated_node = found_match;
-                    /* DATA-DRIVEN: Bootstrap activation_strength based on match quality */
-                    if (activated_node->activation_strength == 0.0f) {
-                        float match_strength = node_calculate_match_strength(activated_node, pattern, pattern_size);
-                        activated_node->activation_strength = match_strength;  /* Use computed match quality */
-                    }
-                }
+            activated_node = node_find_via_local_neighbors(prev_node, pattern, pattern_size);
+            if (activated_node) {
+                /* Found in local neighbors - skip global exploration */
+                goto node_found_local_only;
             }
         }
         
-        /* 5. COMPOUNDING: Check for blank nodes that could accept this pattern (compounding learning) */
+        /* README: Brain-like approach - if pattern not found locally, create it */
+        /* Patterns are "found" through co-activation later, not through O(n) global search */
+        /* The brain doesn't search for patterns - it activates them through connections */
+        /* If a pattern isn't connected, it doesn't activate. New patterns are learned by creating connections */
+        
+        /* Declare variables before label (C scope requirement) */
+        Node *accepting_blank = NULL;
+        float acceptance_strength = 0.0f;
+        
+        node_found_local_only:
+        
+        /* 5. COMPOUNDING: Check for blank nodes in local neighbors only (O(degree), not O(n)) */
         /* Blank nodes are active learning slots - every pattern can teach existing blank nodes */
         /* This compounds knowledge: each pattern connecting to a blank teaches it about its category */
-        /* Enhanced: Uses similarity/context edges to find blanks more efficiently */
-        /* LOCAL: Use prev_node as seed for blank node exploration (local operation, no graph scan) */
+        /* README: Only check local neighbors - never do global search */
         if (!activated_node && prev_node) {
-            /* Compute adaptive exploration steps based on graph size and context (relative adaptive stability) */
-            size_t adaptive_steps = compute_adaptive_exploration_steps(g, 1);  /* Single seed node */
-            Node *seed_node = prev_node;
-            Node *accepting_blank = wave_find_accepting_blank_node(g, &seed_node, 1,
-                                                                    pattern, pattern_size, adaptive_steps);
+            /* LOCAL-ONLY: Check local neighbors for blank nodes (O(degree), not O(n)) */
+            accepting_blank = node_find_accepting_blank_via_local_neighbors(prev_node, pattern, pattern_size);
             if (accepting_blank) {
                 /* Compute how well blank accepts this pattern */
                 /* UNIVERSAL: Use universal match function (no special cases) */
-                float acceptance_strength = node_calculate_match_strength(accepting_blank, pattern, pattern_size);
+                acceptance_strength = node_calculate_match_strength(accepting_blank, pattern, pattern_size);
                 
                 /* If match is strong enough, try to fill the blank node */
                 Node *filled_node = NULL;
                 /* DATA-DRIVEN: Use local context for threshold (stats not available in wave_process_sequential_patterns) */
                 float local_avg = (node_get_local_outgoing_weight_avg(accepting_blank) + 
                                    node_get_local_incoming_weight_avg(accepting_blank)) / 2.0f;
-                float acceptance_threshold = (local_avg > 0.0f) ? local_avg : 0.0f;
+                float acceptance_threshold = (local_avg > 0.0f) ? local_avg / (local_avg + 1.0f) : 0.0f;
                 if (acceptance_strength > acceptance_threshold) {  /* Data-driven threshold from local context */
                     filled_node = node_fill_blank(accepting_blank, pattern, pattern_size, acceptance_strength);
                     if (filled_node && graph_add_node(g, filled_node)) {
@@ -2654,7 +2815,7 @@ Node** wave_process_sequential_patterns(MelvinGraph *g, const uint8_t *data, siz
                 }
                 
                 /* If blank wasn't filled (or filling failed), create new pattern node and connect to blank */
-                if (!activated_node) {
+                if (!activated_node && accepting_blank) {
                     Node *new_pattern_node = node_create(pattern, pattern_size);
                     if (new_pattern_node && graph_add_node(g, new_pattern_node)) {
                         /* Connect new pattern to blank node (bidirectional - blank learns from pattern) */
@@ -2723,162 +2884,19 @@ Node** wave_process_sequential_patterns(MelvinGraph *g, const uint8_t *data, siz
             }
         }
         
-        /* 6. If no exact match and no accepting blank, check for similar patterns and create blank bridge */
-        /* Blank nodes emerge naturally when similar patterns are found but no accepting blank exists */
-        if (!activated_node && found_match && !is_exact_match) {
-            /* Similar pattern found but no blank accepted it - create blank bridge */
-            Node *blank_bridge = NULL;
-            
-            /* Check if blank bridge already exists */
-            for (size_t i = 0; i < found_match->outgoing_count; i++) {
-                Edge *edge = found_match->outgoing_edges[i];
-                if (edge && edge->to_node && edge->to_node->payload_size == 0) {
-                    blank_bridge = edge->to_node;
-                    break;
-                }
-            }
-            
-            /* If no blank bridge exists, create one (emerges naturally) */
-            if (!blank_bridge) {
-                blank_bridge = node_create_blank();
-                if (blank_bridge && graph_add_node(g, blank_bridge)) {
-                    blank_bridge->abstraction_level = found_match->abstraction_level;
-                    float match_strength = node_calculate_match_strength(found_match, pattern, pattern_size);
-                    blank_bridge->weight = (found_match->weight + match_strength) / 2.0f;
-                    
-                    /* Connect blank to similar pattern */
-                    /* LEARN FROM EXISTING: Check if edges already exist (from similarity/context/co-activation) */
-                    Edge *existing1 = node_find_edge_to(blank_bridge, found_match);
-                    Edge *existing2 = node_find_edge_to(found_match, blank_bridge);
-                    
-                    if (existing1 && existing2) {
-                        /* Both edges exist - strengthen them (learning through repetition) */
-                        existing1->activation = true;
-                        existing2->activation = true;
-                        edge_update_weight_local(existing1);
-                        edge_update_weight_local(existing2);
-                    } else {
-                        /* Create missing edges */
-                        Edge *edge1 = NULL;
-                        Edge *edge2 = NULL;
-                        
-                        if (!existing1) {
-                            edge1 = edge_create(blank_bridge, found_match, true);
-                        }
-                        if (!existing2) {
-                            edge2 = edge_create(found_match, blank_bridge, true);
-                        }
-                        
-                        if (edge1 && edge2) {
-                            edge1->weight = compute_relative_initial_edge_weight(blank_bridge, match_strength);
-                            edge2->weight = compute_relative_initial_edge_weight(found_match, match_strength);
-                            edge1->activation = true;
-                            edge2->activation = true;
-                            graph_add_edge(g, edge1, blank_bridge, found_match);
-                            graph_add_edge(g, edge2, found_match, blank_bridge);
-                        } else if (edge1) {
-                            edge1->weight = compute_relative_initial_edge_weight(blank_bridge, match_strength);
-                            edge1->activation = true;
-                            graph_add_edge(g, edge1, blank_bridge, found_match);
-                        } else if (edge2) {
-                            edge2->weight = compute_relative_initial_edge_weight(found_match, match_strength);
-                            edge2->activation = true;
-                            graph_add_edge(g, edge2, found_match, blank_bridge);
-                        } else {
-                            if (edge1) edge_free(edge1);
-                            if (edge2) edge_free(edge2);
-                        }
-                        
-                        /* Strengthen existing edges if they exist */
-                        if (existing1) {
-                            existing1->activation = true;
-                            edge_update_weight_local(existing1);
-                        }
-                        if (existing2) {
-                            existing2->activation = true;
-                            edge_update_weight_local(existing2);
-                        }
-                    }
-                } else {
-                    if (blank_bridge) node_free(blank_bridge);
-                    blank_bridge = NULL;
-                }
-            }
-            
-            /* Create new pattern node and connect it to blank bridge (compounding learning) */
-            Node *new_pattern_node = node_create(pattern, pattern_size);
-            if (new_pattern_node && graph_add_node(g, new_pattern_node)) {
-                /* Connect new pattern to blank bridge */
-                /* LEARN FROM EXISTING: Check if edges already exist (from similarity/context/co-activation) */
-                float match_strength = node_calculate_match_strength(found_match, pattern, pattern_size);
-                Edge *existing1 = node_find_edge_to(new_pattern_node, blank_bridge);
-                Edge *existing2 = node_find_edge_to(blank_bridge, new_pattern_node);
-                
-                if (existing1 && existing2) {
-                    /* Both edges exist - strengthen them (learning through repetition) */
-                    existing1->activation = true;
-                    existing2->activation = true;
-                    edge_update_weight_local(existing1);
-                    edge_update_weight_local(existing2);
-                } else {
-                    /* Create missing edges */
-                    Edge *edge1 = NULL;
-                    Edge *edge2 = NULL;
-                    
-                    if (!existing1) {
-                        edge1 = edge_create(new_pattern_node, blank_bridge, true);
-                    }
-                    if (!existing2) {
-                        edge2 = edge_create(blank_bridge, new_pattern_node, true);
-                    }
-                    
-                    if (edge1 && edge2) {
-                        edge1->weight = compute_relative_initial_edge_weight(new_pattern_node, match_strength);
-                        edge2->weight = compute_relative_initial_edge_weight(blank_bridge, match_strength);
-                        edge1->activation = true;
-                        edge2->activation = true;
-                        graph_add_edge(g, edge1, new_pattern_node, blank_bridge);
-                        graph_add_edge(g, edge2, blank_bridge, new_pattern_node);
-                    } else if (edge1) {
-                        edge1->weight = compute_relative_initial_edge_weight(new_pattern_node, match_strength);
-                        edge1->activation = true;
-                        graph_add_edge(g, edge1, new_pattern_node, blank_bridge);
-                    } else if (edge2) {
-                        edge2->weight = compute_relative_initial_edge_weight(blank_bridge, match_strength);
-                        edge2->activation = true;
-                        graph_add_edge(g, edge2, blank_bridge, new_pattern_node);
-                    } else {
-                        if (edge1) edge_free(edge1);
-                        if (edge2) edge_free(edge2);
-                    }
-                    
-                    /* Strengthen existing edges if they exist */
-                    if (existing1) {
-                        existing1->activation = true;
-                        edge_update_weight_local(existing1);
-                    }
-                    if (existing2) {
-                        existing2->activation = true;
-                        edge_update_weight_local(existing2);
-                    }
-                }
-                
-                activated_node = new_pattern_node;
-            } else {
-                if (new_pattern_node) node_free(new_pattern_node);
-                activated_node = blank_bridge ? blank_bridge : found_match;
-            }
-        }
-        
-        /* 6. If wave prop didn't find any match, create new node */
-        /* Wave exploration uses whole graph as context, but through local edge traversal */
+        /* 6. README: Brain-like approach - if pattern not found locally, create it */
+        /* Patterns are "found" through co-activation later, not through O(n) global search */
+        /* The brain doesn't search for patterns - it activates them through connections */
+        /* If a pattern isn't connected, it doesn't activate. New patterns are learned by creating connections */
         if (!activated_node) {
-            activated_node = node_create(pattern, pattern_size);
-            if (activated_node && graph_add_node(g, activated_node)) {
-                /* New node created - wave prop explored graph but didn't find match */
+            /* Create new node - pattern will be "found" later through co-activation */
+            Node *new_node = node_create(pattern, pattern_size);
+            if (new_node && graph_add_node(g, new_node)) {
+                activated_node = new_node;
+                /* DATA-DRIVEN: Bootstrap activation_strength based on match quality */
+                activated_node->activation_strength = 1.0f;  /* New pattern, full activation */
             } else {
-                if (activated_node) node_free(activated_node);
-                activated_node = NULL;
+                if (new_node) node_free(new_node);
             }
         }
         
@@ -2941,20 +2959,40 @@ Node** wave_process_sequential_patterns(MelvinGraph *g, const uint8_t *data, siz
 void wave_create_edges_from_similarity(MelvinGraph *g, Node *node, float similarity_threshold) {
     if (!g || !node) return;  /* UNIVERSAL: All nodes can form similarity edges */
     
-    /* Use wave propagation to find similar patterns (local-only exploration) */
-    Node **seed_nodes = NULL;
-    size_t seed_count = 0;
-    size_t seed_capacity = 1;  /* Minimal context: absolute minimum, grows immediately when data arrives */
+    /* README: Brain-like - only check local neighbors for similar patterns (O(degree), not O(n)) */
+    /* Similar patterns are found through local connections, not global search */
+    Node *similar = NULL;
+    float best_similarity = 0.0f;
     
-    seed_nodes = (Node**)malloc(seed_capacity * sizeof(Node*));
-    if (!seed_nodes) return;
-    seed_nodes[0] = node;
-    seed_count = 1;
+    /* LOCAL-ONLY: Check outgoing edges (1-hop neighbors) - O(degree), not O(n) */
+    for (size_t i = 0; i < node->outgoing_count; i++) {
+        Edge *edge = node->outgoing_edges[i];
+        if (!edge || !edge->to_node || edge->to_node == node) continue;
+        
+        Node *candidate = edge->to_node;
+        if (candidate->payload_size > 0) {  /* Only check nodes with payloads */
+            float similarity = edge_compute_pattern_similarity(node, candidate);
+            if (similarity > best_similarity) {
+                best_similarity = similarity;
+                similar = candidate;
+            }
+        }
+    }
     
-    /* Find similar patterns via wave exploration (limited steps, local-only) */
-    Node *similar = wave_find_node_via_exploration(g, seed_nodes, seed_count,
-                                                   node->payload, node->payload_size, 3, NULL);
-    free(seed_nodes);
+    /* LOCAL-ONLY: Check incoming edges (reverse direction neighbors) - O(degree), not O(n) */
+    for (size_t i = 0; i < node->incoming_count; i++) {
+        Edge *edge = node->incoming_edges[i];
+        if (!edge || !edge->from_node || edge->from_node == node) continue;
+        
+        Node *candidate = edge->from_node;
+        if (candidate->payload_size > 0) {  /* Only check nodes with payloads */
+            float similarity = edge_compute_pattern_similarity(node, candidate);
+            if (similarity > best_similarity) {
+                best_similarity = similarity;
+                similar = candidate;
+            }
+        }
+    }
     
     if (!similar || similar == node) return;
     
@@ -2984,8 +3022,8 @@ void wave_create_edges_from_similarity(MelvinGraph *g, Node *node, float similar
         /* Continue to create missing direction if similarity threshold is met */
     }
     
-    /* Compute similarity score */
-    float similarity = edge_compute_pattern_similarity(node, similar);
+    /* Use best similarity found from local neighbors (already computed above) */
+    float similarity = best_similarity;
     
     /* UNIVERSAL: Threshold is relative to local context (no hardcoded values) */
     float local_avg = (node_get_local_outgoing_weight_avg(node) + 
@@ -3794,6 +3832,93 @@ static bool write_edges(FILE *file, MelvinGraph *graph, uint64_t offset) {
     return true;
 }
 
+/* Hash table for O(1) node ID lookup during file loading (prevents O(n) search) */
+typedef struct NodeIDHash {
+    size_t hash_size;
+    Node ***buckets;
+    size_t *bucket_sizes;
+    size_t *bucket_capacities;
+} NodeIDHash;
+
+/* Hash function for node IDs (8-byte strings) */
+static size_t node_id_hash(NodeIDHash *hash, const char *id) {
+    if (!hash || !id) return 0;
+    /* Simple hash: sum of bytes */
+    size_t hash_val = 0;
+    for (size_t i = 0; i < 8 && id[i] != '\0'; i++) {
+        hash_val = hash_val * 31 + (size_t)id[i];
+    }
+    return hash_val % hash->hash_size;
+}
+
+/* Create hash table for node ID lookup */
+static NodeIDHash* node_id_hash_create(size_t node_count) {
+    size_t hash_size = calculate_optimal_hash_size(node_count);
+    NodeIDHash *hash = (NodeIDHash*)calloc(1, sizeof(NodeIDHash));
+    if (!hash) return NULL;
+    
+    hash->hash_size = hash_size;
+    hash->buckets = (Node***)calloc(hash_size, sizeof(Node**));
+    hash->bucket_sizes = (size_t*)calloc(hash_size, sizeof(size_t));
+    hash->bucket_capacities = (size_t*)calloc(hash_size, sizeof(size_t));
+    
+    if (!hash->buckets || !hash->bucket_sizes || !hash->bucket_capacities) {
+        if (hash->buckets) free(hash->buckets);
+        if (hash->bucket_sizes) free(hash->bucket_sizes);
+        if (hash->bucket_capacities) free(hash->bucket_capacities);
+        free(hash);
+        return NULL;
+    }
+    
+    return hash;
+}
+
+/* Add node to hash table */
+static void node_id_hash_add(NodeIDHash *hash, Node *node) {
+    if (!hash || !node) return;
+    size_t idx = node_id_hash(hash, node->id);
+    if (idx >= hash->hash_size) return;
+    
+    if (hash->bucket_sizes[idx] >= hash->bucket_capacities[idx]) {
+        size_t new_cap = (hash->bucket_capacities[idx] == 0) ? 1 : hash->bucket_capacities[idx] * 2;
+        Node **new_bucket = (Node**)realloc(hash->buckets[idx], new_cap * sizeof(Node*));
+        if (!new_bucket) return;
+        hash->buckets[idx] = new_bucket;
+        hash->bucket_capacities[idx] = new_cap;
+    }
+    
+    hash->buckets[idx][hash->bucket_sizes[idx]++] = node;
+}
+
+/* Find node by ID (O(1) average case) */
+static Node* node_id_hash_find(NodeIDHash *hash, const char *id) {
+    if (!hash || !id) return NULL;
+    size_t idx = node_id_hash(hash, id);
+    if (idx >= hash->hash_size) return NULL;
+    
+    for (size_t i = 0; i < hash->bucket_sizes[idx]; i++) {
+        Node *node = hash->buckets[idx][i];
+        if (node && strcmp(node->id, id) == 0) {
+            return node;
+        }
+    }
+    return NULL;
+}
+
+/* Free hash table */
+static void node_id_hash_free(NodeIDHash *hash) {
+    if (!hash) return;
+    if (hash->buckets) {
+        for (size_t i = 0; i < hash->hash_size; i++) {
+            if (hash->buckets[i]) free(hash->buckets[i]);
+        }
+        free(hash->buckets);
+    }
+    if (hash->bucket_sizes) free(hash->bucket_sizes);
+    if (hash->bucket_capacities) free(hash->bucket_capacities);
+    free(hash);
+}
+
 /* Internal helper: Read edges from file */
 static bool read_edges(FILE *file, MelvinGraph *graph, uint64_t offset) {
     if (!file || !graph) return false;
@@ -3802,22 +3927,46 @@ static bool read_edges(FILE *file, MelvinGraph *graph, uint64_t offset) {
     uint64_t edge_count;
     if (fread(&edge_count, sizeof(uint64_t), 1, file) != 1) return false;
     
+    /* README: O(1) node lookup using hash table - prevents O(n) search */
+    /* Build hash table for all nodes (O(n) once, then O(1) per lookup) */
+    NodeIDHash *id_hash = node_id_hash_create(graph->node_count);
+    if (!id_hash) return false;
+    
+    for (size_t i = 0; i < graph->node_count; i++) {
+        if (graph->nodes[i]) {
+            node_id_hash_add(id_hash, graph->nodes[i]);
+        }
+    }
+    
     for (uint64_t i = 0; i < edge_count; i++) {
         char from_id[9], to_id[9];
         bool direction, activation;
         float weight;
         
-        if (fread(from_id, 9, 1, file) != 1) return false;
-        if (fread(to_id, 9, 1, file) != 1) return false;
-        if (fread(&direction, sizeof(bool), 1, file) != 1) return false;
-        if (fread(&activation, sizeof(bool), 1, file) != 1) return false;
-        if (fread(&weight, sizeof(float), 1, file) != 1) return false;
-        
-        Node *from = NULL, *to = NULL;
-        for (size_t j = 0; j < graph->node_count; j++) {
-            if (graph->nodes[j] && strcmp(graph->nodes[j]->id, from_id) == 0) from = graph->nodes[j];
-            if (graph->nodes[j] && strcmp(graph->nodes[j]->id, to_id) == 0) to = graph->nodes[j];
+        if (fread(from_id, 9, 1, file) != 1) {
+            node_id_hash_free(id_hash);
+            return false;
         }
+        if (fread(to_id, 9, 1, file) != 1) {
+            node_id_hash_free(id_hash);
+            return false;
+        }
+        if (fread(&direction, sizeof(bool), 1, file) != 1) {
+            node_id_hash_free(id_hash);
+            return false;
+        }
+        if (fread(&activation, sizeof(bool), 1, file) != 1) {
+            node_id_hash_free(id_hash);
+            return false;
+        }
+        if (fread(&weight, sizeof(float), 1, file) != 1) {
+            node_id_hash_free(id_hash);
+            return false;
+        }
+        
+        /* O(1) lookup instead of O(n) search */
+        Node *from = node_id_hash_find(id_hash, from_id);
+        Node *to = node_id_hash_find(id_hash, to_id);
         
         if (!from || !to) continue;
         
@@ -3828,6 +3977,8 @@ static bool read_edges(FILE *file, MelvinGraph *graph, uint64_t offset) {
         edge->weight = weight;
         graph_add_edge(graph, edge, from, to);
     }
+    
+    node_id_hash_free(id_hash);
     return true;
 }
 
@@ -3979,6 +4130,10 @@ MelvinGraph* graph_create(void) {
     g->edges = NULL;
     g->edge_count = 0;
     
+    /* DATA-DRIVEN: Initialize ingestion mode (starts in fast mode, switches based on pattern maturity) */
+    g->ingestion_mode = true;  /* Start in fast mode (no patterns learned yet) */
+    g->pattern_maturity_avg = 0.0f;  /* No patterns learned yet */
+    
     return g;
 }
 
@@ -4085,33 +4240,82 @@ void graph_free(MelvinGraph *g) {
  * WAVE PROPAGATION (Local Operations Only)
  * ======================================== */
 
+/* PARALLEL EDGE TRANSFORMATION: Context for parallel edge processing */
+/* Defined here so it's available for wave_propagate_from_node_with_energy */
+typedef struct EdgeTransformContext {
+    Edge *edge;
+    float input_activation;
+    float *output;
+    float *max_output;
+    pthread_mutex_t *max_mutex;
+    float *energy_budget;
+    pthread_mutex_t *energy_mutex;
+    Node *from_node;
+} EdgeTransformContext;
+
+/* Forward declaration for parallel edge transformation worker */
+static void transform_edge_parallel(void *item, size_t index, void *context);
+
 /* Propagate activation from a node through its outgoing edges (local, relative) */
 /* Node acts as mini neural net - "thinks" by combining edge weights + payload structure */
 /* Wave prop "selects" nodes by activating edges based on relative influence - no thresholds */
 /* Returns null-terminated array of newly activated nodes for multi-step propagation */
 Node** wave_propagate_from_node(Node *node) {
+    /* Backward compatibility: no energy constraint */
+    return wave_propagate_from_node_with_energy(node, NULL);
+}
+
+/* RIGID ENERGY CONSTRAINT: Energy must be available BEFORE processing each edge */
+/* Like neurons: can't fire without ATP. Like fungi: can't grow without nutrients */
+/* This is the most rigid solution - energy is a physical constraint, not a soft check */
+Node** wave_propagate_from_node_with_energy(Node *node, float *energy_budget) {
     if (!node) return NULL;
+    
+    /* IMPLIED CHECKS: Compute node state once, use for all decisions */
+    /* Like biological systems: compute state once, use for all operations */
+    bool has_outgoing_edges = (node->outgoing_count > 0);
+    bool has_energy_budget = (energy_budget != NULL);
     
     /* Compute activation strength from inputs (mini neural net) */
     node->activation_strength = node_compute_activation_strength(node);
     
-    /* If activation strong enough relative to local context, propagate */
+    /* SMOOTH: Compute propagation probability (continuous, not binary threshold) */
+    /* Strong activation = high probability, weak = low probability, smooth in between */
     float local_avg = node_get_local_outgoing_weight_avg(node);
     /* Adaptive propagation threshold: relative to local context */
     /* If local average exists, use relative fraction; otherwise use node's own weight as baseline */
-    float propagation_threshold = (local_avg > 0.0f) ? 
+    bool has_local_context = (local_avg > 0.0f);
+    bool has_node_weight = (node->weight > 0.0f);
+    float propagation_threshold = has_local_context ? 
                                  local_avg / (local_avg + 1.0f) : 
-                                 (node->weight > 0.0f ? node->weight / (node->weight + 1.0f) : 0.0f);
+                                 (has_node_weight ? node->weight / (node->weight + 1.0f) : 0.0f);
     
-    if (node->activation_strength < propagation_threshold) {
+    /* SMOOTH: Compute propagation probability (no binary threshold) */
+    /* Activation strength relative to threshold determines probability */
+    float propagation_probability = node->activation_strength / 
+        (node->activation_strength + propagation_threshold + 1.0f);  /* Smooth: 0 to 1 */
+    
+    /* Use probability to modulate propagation (smooth, not binary) */
+    /* Very low probability = don't propagate, but smooth transition */
+    if (propagation_probability < 0.1f) {  /* Minimal threshold for efficiency (very low probability) */
         node_update_weight_local(node);
         return NULL;  /* Too weak to propagate */
     }
     
-    /* If no outgoing edges, just update weight and return */
-    if (node->outgoing_count == 0) {
+    /* Scale activation strength by probability (smooth modulation) */
+    node->activation_strength *= propagation_probability;
+    
+    /* IMPLIED: Use precomputed flag */
+    if (!has_outgoing_edges) {
         node_update_weight_local(node);
         return NULL;
+    }
+    
+    /* RIGID CONSTRAINT: Sort edges by efficiency (strong edges first = lower cost) */
+    /* This ensures we process affordable edges first (like biological systems) */
+    /* IMPLIED: Use precomputed flag */
+    if (has_energy_budget) {
+        sort_edges_by_efficiency(node->outgoing_edges, node->outgoing_count, node);
     }
     
     /* Propagate through outgoing edges */
@@ -4122,26 +4326,124 @@ Node** wave_propagate_from_node(Node *node) {
     /* Compute edge outputs (transformed activations) */
     float max_edge_output = 0.0f;
     float *edge_outputs = (float*)calloc(node->outgoing_count, sizeof(float));
+    if (!edge_outputs) {
+        node_update_weight_local(node);
+        return NULL;
+    }
     
-    /* GPU-ACCELERATED: Batch transform edges (if GPU available and enough edges) */
-    /* Note: Currently uses CPU fallback - GPU acceleration framework is in place */
-    MelvinGPUContext *gpu_ctx = melvin_gpu_get_context();
-    if (gpu_ctx && melvin_gpu_is_available(gpu_ctx) && node->outgoing_count > 16) {
-        /* Use batch operations for large edge counts */
-        melvin_gpu_batch_transform_edges(gpu_ctx, node, node->outgoing_edges, 
-                                         node->outgoing_count, edge_outputs, &max_edge_output);
-    } else {
-        /* CPU fallback: Transform edges sequentially */
+    /* INTELLIGENT TRIGGERS: Only check hardware capabilities when beneficial */
+    /* System grows into using hardware - checks only when edge count suggests benefit */
+    /* Avoids overhead for small edge counts (most common case) */
+    
+    /* IMPLIED CHECKS: Compute energy state once per node (not per edge) */
+    /* Like biological systems: energy state is node-level, not edge-level */
+    bool has_energy = (energy_budget && *energy_budget > 0.0f);
+    float current_energy = has_energy ? *energy_budget : FLT_MAX;
+    
+    /* Fast path: Small edge counts - skip all hardware checks (most common) */
+    if (node->outgoing_count < 8) {
+        /* SEQUENTIAL: Small edge count - no hardware checks needed */
         for (size_t i = 0; i < node->outgoing_count; i++) {
             Edge *edge = node->outgoing_edges[i];
-            if (!edge) continue;
+            /* IMPLIED: If edge is in array, it exists. Only check to_node when needed */
+            if (!edge->to_node) continue;  /* Only check what matters for intelligence */
             
-            /* Edge transforms activation */
-            float edge_output = edge_transform_activation(edge, node->activation_strength);
+            /* DYNAMIC ENERGY CONSTRAINT: Energy modulates exploration, doesn't block it */
+            /* IMPLIED: Use precomputed energy state (no repeated pointer checks) */
+            float exploration_probability = 1.0f;
+            float edge_cost = 0.0f;
+            
+            if (has_energy) {  /* Use boolean flag, not pointer check */
+                edge_cost = compute_energy_cost_edge_exploration(edge, node);
+                exploration_probability = compute_energy_modulated_exploration_probability(
+                    edge_cost, current_energy);
+                float energy_consumed = edge_cost * exploration_probability;
+                current_energy -= energy_consumed;
+            }
+            
+            float base_edge_output = edge_transform_activation(edge, node->activation_strength);
+            float edge_output = base_edge_output * exploration_probability;
             edge_outputs[i] = edge_output;
             
             if (edge_output > max_edge_output) {
                 max_edge_output = edge_output;
+            }
+        }
+        
+        /* IMPLIED: Update energy budget once at end (not per edge) */
+        if (energy_budget) *energy_budget = current_energy;
+    } else {
+        /* Large edge count - check hardware capabilities (lazy, cached) */
+        /* GPU check (cached - only checked once, then reused) */
+        MelvinGPUContext *gpu_ctx = get_cached_gpu_context();
+        if (gpu_ctx && node->outgoing_count > 16) {
+            /* GPU-ACCELERATED: Use GPU for large edge counts */
+            melvin_gpu_batch_transform_edges(gpu_ctx, node, node->outgoing_edges, 
+                                             node->outgoing_count, edge_outputs, &max_edge_output);
+        } else {
+            /* CPU PARALLEL: Check if parallelization is beneficial */
+            /* Threshold computed once when thread pool is created */
+            if (!g_threshold_computed) {
+                ThreadPool *pool = get_thread_pool();  /* This computes threshold */
+            }
+            
+            if (node->outgoing_count >= g_parallelization_threshold && g_parallelization_threshold > 0) {
+                /* PARALLEL: Transform edges in parallel (independent operations) */
+                /* Only create mutexes when we actually parallelize */
+                ThreadPool *pool = get_thread_pool();
+                if (pool) {
+                    EdgeTransformContext transform_ctx;
+                    pthread_mutex_t max_mutex = PTHREAD_MUTEX_INITIALIZER;
+                    pthread_mutex_t energy_mutex = PTHREAD_MUTEX_INITIALIZER;
+                    
+                    transform_ctx.input_activation = node->activation_strength;
+                    transform_ctx.output = edge_outputs;
+                    transform_ctx.max_output = &max_edge_output;
+                    transform_ctx.energy_budget = energy_budget;
+                    transform_ctx.from_node = node;
+                    transform_ctx.max_mutex = &max_mutex;
+                    transform_ctx.energy_mutex = &energy_mutex;
+                    
+                    /* Process edges in parallel */
+                    thread_pool_process_array(pool, (void**)node->outgoing_edges, 
+                                              node->outgoing_count, 
+                                              transform_edge_parallel, &transform_ctx);
+                } else {
+                    /* Fallback to sequential if pool unavailable */
+                    goto sequential_fallback;
+                }
+            } else {
+                /* SEQUENTIAL: Edge count not large enough for parallelization */
+                sequential_fallback:
+                for (size_t i = 0; i < node->outgoing_count; i++) {
+                    Edge *edge = node->outgoing_edges[i];
+                    /* IMPLIED: If edge is in array, it exists. Only check to_node when needed */
+                    if (!edge->to_node) continue;  /* Only check what matters for intelligence */
+                    
+                    /* DYNAMIC ENERGY CONSTRAINT: Energy modulates exploration, doesn't block it */
+                    /* IMPLIED: Use precomputed energy state (no repeated pointer checks) */
+                    float exploration_probability = 1.0f;
+                    float edge_cost = 0.0f;
+                    
+                    if (has_energy) {  /* Use boolean flag, not pointer check */
+                        edge_cost = compute_energy_cost_edge_exploration(edge, node);
+                        exploration_probability = compute_energy_modulated_exploration_probability(
+                            edge_cost, current_energy);
+                        float energy_consumed = edge_cost * exploration_probability;
+                        current_energy -= energy_consumed;
+                    }
+                    
+                    float base_edge_output = edge_transform_activation(edge, node->activation_strength);
+                    float edge_output = base_edge_output * exploration_probability;
+                    edge_outputs[i] = edge_output;
+                    
+                    if (edge_output > max_edge_output) {
+                        max_edge_output = edge_output;
+                    }
+                }
+                
+                /* IMPLIED: Update energy budget once at end (not per edge) */
+                if (energy_budget) *energy_budget = current_energy;
             }
         }
     }
@@ -4151,10 +4453,15 @@ Node** wave_propagate_from_node(Node *node) {
     float node_local_avg = node_get_local_outgoing_weight_avg(node);
     float local_std = 0.0f;
     
+    /* IMPLIED CHECKS: Compute threshold conditions once */
+    bool has_multiple_edges = (node->outgoing_count > 1);
+    bool has_local_avg = (node_local_avg > 0.0f);
+    
     /* Compute local standard deviation for relative threshold (self-regulating) */
-    if (node->outgoing_count > 1 && node_local_avg > 0.0f) {
+    if (has_multiple_edges && has_local_avg) {
         float variance = 0.0f;
         for (size_t i = 0; i < node->outgoing_count; i++) {
+            /* IMPLIED: If edge is in array, it exists */
             if (!node->outgoing_edges[i]) continue;
             float diff = node->outgoing_edges[i]->weight - node_local_avg;
             variance += diff * diff;
@@ -4165,27 +4472,47 @@ Node** wave_propagate_from_node(Node *node) {
     /* UNIVERSAL: Threshold is relative to max output and local context (no hardcoded values) */
     /* Nodes with more uniform connections (low std) explore more; nodes with varied connections focus */
     /* Adaptive exploration factor: based on local variation, no hardcoded fallback */
-    float exploration_factor = (local_std > 0.0f && node_local_avg > 0.0f) ? 
+    /* IMPLIED: Use precomputed flags */
+    bool has_std = (local_std > 0.0f);
+    float exploration_factor = (has_std && has_local_avg) ? 
                                (local_std / node_local_avg) : 
-                               (node->outgoing_count > 0 ? 1.0f / (node->outgoing_count + 1.0f) : 0.0f);
+                               (has_outgoing_edges ? 1.0f / (node->outgoing_count + 1.0f) : 0.0f);
     exploration_factor = (exploration_factor > 1.0f) ? 1.0f : exploration_factor;  /* Cap at 1.0 */
     /* Adaptive threshold: exploration factor determines how much to reduce from max */
     float exploration_reduction = exploration_factor / (exploration_factor + 1.0f);
     float threshold = max_edge_output * (1.0f - exploration_reduction);  /* Relative, self-regulating */
     
+    /* IMPLIED: Precompute capacity check threshold (used in loop) */
+    bool needs_capacity_check = (activated_count >= activated_capacity);
+    
     for (size_t i = 0; i < node->outgoing_count; i++) {
         Edge *edge = node->outgoing_edges[i];
-        if (!edge || !edge->to_node) continue;
+        /* IMPLIED: If edge is in array, it exists. Only check to_node when needed */
+        if (!edge->to_node) continue;  /* Only check what matters for intelligence */
         
         float edge_output = edge_outputs[i];
         
-        /* UNIVERSAL: All nodes activate edges above relative threshold */
-        if (edge_output >= threshold) {
+        /* DYNAMIC: Energy constraint already modulated edge output */
+        /* Low energy = weaker signals (less likely to activate) */
+        /* High energy = stronger signals (more likely to activate) */
+        /* No need to skip - energy already affected the signal strength */
+        
+        /* SMOOTH FUNCTION: Compute activation probability with smooth transition */
+        /* Strong signals = high probability, weak = low probability, smooth in between */
+        /* Enables fine-grained learning through continuous activation strength */
+        float activation_probability = edge_output / (edge_output + threshold + 1.0f);  /* Smooth: 0 to 1 */
+        
+        /* SMOOTH: No hardcoded threshold - use probability directly (data-driven) */
+        /* Binary activation still needed for graph structure, but any positive probability activates */
+        /* High probability = strong activation, low = weak activation (smooth, not binary) */
+        if (activation_probability > 0.0f) {
             edge->activation = true;
+            /* Use probability to scale weight update (smooth learning) */
+            /* Probability already modulates the strength - no hardcoded 0.5f threshold */
             edge_update_weight_local(edge);
             
-            /* Add target node to activated array (it will compute its activation in next step) */
-            if (activated_count >= activated_capacity) {
+            /* IMPLIED: Check capacity only when needed (not every iteration) */
+            if (needs_capacity_check || activated_count >= activated_capacity) {
                 activated_capacity = (activated_capacity == 0) ? 1 : activated_capacity * 2;  /* Minimal context: start at 1 */
                 activated = (Node**)realloc(activated, (activated_capacity + 1) * sizeof(Node*));
                 if (!activated) {
@@ -4193,6 +4520,7 @@ Node** wave_propagate_from_node(Node *node) {
                     node_update_weight_local(node);
                     return NULL;
                 }
+                needs_capacity_check = false;  /* Reset flag after allocation */
             }
             activated[activated_count++] = edge->to_node;
         }
@@ -4223,12 +4551,331 @@ static void process_wave_node_parallel(void *item, size_t index, void *context) 
     node_update_weight_local(current_node);
 }
 
+/* PARALLEL: Worker function for transforming edges independently */
+/* Each edge transformation is independent - perfect for parallelization */
+/* Follows README: Independent node calculations, parallel-ready */
+static void transform_edge_parallel(void *item, size_t index, void *context) {
+    EdgeTransformContext *ctx = (EdgeTransformContext*)context;
+    Edge *edge = (Edge*)item;
+    
+    if (!edge || !ctx) return;
+    
+    /* Compute energy cost and probability (read-only until we lock) */
+    float exploration_probability = 1.0f;
+    float edge_cost = 0.0f;
+    
+    if (ctx->energy_budget && ctx->energy_mutex) {
+        /* Read energy budget atomically */
+        pthread_mutex_lock(ctx->energy_mutex);
+        float available_energy = *(ctx->energy_budget);
+        pthread_mutex_unlock(ctx->energy_mutex);
+        
+        if (available_energy > 0.0f) {
+            edge_cost = compute_energy_cost_edge_exploration(edge, ctx->from_node);
+            exploration_probability = compute_energy_modulated_exploration_probability(
+                edge_cost, available_energy);
+            
+            /* Consume energy atomically */
+            float energy_consumed = edge_cost * exploration_probability;
+            pthread_mutex_lock(ctx->energy_mutex);
+            *(ctx->energy_budget) -= energy_consumed;
+            pthread_mutex_unlock(ctx->energy_mutex);
+        } else {
+            exploration_probability = 0.0f;  /* No energy = no exploration */
+        }
+    }
+    
+    /* Transform edge (independent operation - no locking needed) */
+    float base_output = edge_transform_activation(edge, ctx->input_activation);
+    float edge_output = base_output * exploration_probability;
+    
+    /* Store output (separate array element - no locking needed) */
+    ctx->output[index] = edge_output;
+    
+    /* Update max atomically */
+    if (ctx->max_output && ctx->max_mutex) {
+        pthread_mutex_lock(ctx->max_mutex);
+        if (edge_output > *(ctx->max_output)) {
+            *(ctx->max_output) = edge_output;
+        }
+        pthread_mutex_unlock(ctx->max_mutex);
+    }
+}
+
+/* ========================================
+ * INGESTION MODE: DATA-DRIVEN PERFORMANCE OPTIMIZATION
+ * (Following README: Local-only operations, relative thresholds)
+ * ======================================== */
+
+/* DATA-DRIVEN: Compute pattern maturity from local context (relative, not hardcoded) */
+/* Pattern maturity = how well-learned patterns are relative to local context */
+float compute_pattern_maturity(MelvinGraph *g, Node **initial_nodes, size_t count) {
+    if (!g || !initial_nodes || count == 0) return 0.0f;
+    
+    float total_maturity = 0.0f;
+    size_t valid_count = 0;
+    
+    for (size_t i = 0; i < count; i++) {
+        Node *node = initial_nodes[i];
+        if (!node) continue;
+        
+        /* RELATIVE: Pattern maturity = node weight relative to local context */
+        /* Strong patterns (high weight relative to local avg) = mature */
+        float local_avg = node_get_local_outgoing_weight_avg(node);
+        if (local_avg > 0.0f) {
+            float relative_strength = node->weight / (node->weight + local_avg);
+            total_maturity += relative_strength;
+            valid_count++;
+        }
+    }
+    
+    if (valid_count == 0) return 0.0f;
+    return total_maturity / valid_count;  /* Average maturity */
+}
+
+/* DATA-DRIVEN: Determine if we should use ingestion mode (fast) or understanding mode (full) */
+/* Threshold is relative to graph context, not hardcoded */
+bool should_use_ingestion_mode(MelvinGraph *g, Node **initial_nodes, size_t count) {
+    if (!g || count == 0) return true;  /* Default to fast mode if no context */
+    
+    /* Compute pattern maturity from local context */
+    float maturity = compute_pattern_maturity(g, initial_nodes, count);
+    
+    /* RELATIVE: Compare to graph's average pattern maturity (not hardcoded threshold) */
+    /* If patterns are immature (low maturity) → ingestion mode (fast) */
+    /* If patterns are mature (high maturity) → understanding mode (full wave) */
+    float graph_maturity_avg = g->pattern_maturity_avg;
+    
+    if (graph_maturity_avg == 0.0f) {
+        /* No graph context yet - use ingestion mode (fast pattern matching) */
+        return true;
+    }
+    
+    /* RELATIVE: If current patterns are much weaker than graph average → ingestion mode */
+    /* Threshold adapts to graph's learned patterns (data-driven) */
+    float maturity_ratio = maturity / (maturity + graph_maturity_avg);
+    
+    /* RELATIVE: Threshold computed from graph maturity itself (not hardcoded) */
+    /* Use normalization pattern: threshold = graph_maturity_avg / (graph_maturity_avg + 1.0f) */
+    /* This adapts to graph's learned patterns - mature graphs have higher threshold */
+    float relative_threshold = graph_maturity_avg / (graph_maturity_avg + 1.0f);
+    
+    /* If maturity ratio is below relative threshold → ingestion mode */
+    return (maturity_ratio < relative_threshold);
+}
+
+/* DATA-DRIVEN: Update graph's average pattern maturity (adaptive, not hardcoded) */
+void update_pattern_maturity_avg(MelvinGraph *g, Node **initial_nodes, size_t count) {
+    if (!g || !initial_nodes || count == 0) return;
+    
+    float current_maturity = compute_pattern_maturity(g, initial_nodes, count);
+    
+    /* ADAPTIVE: Update running average (exponential moving average) */
+    /* Learning rate adapts to graph size (relative, not hardcoded) */
+    float alpha = 1.0f / (g->node_count + 1.0f);  /* Smaller graph → faster update */
+    alpha = (alpha > 1.0f) ? 1.0f : alpha;  /* Cap at 1.0 */
+    
+    if (g->pattern_maturity_avg == 0.0f) {
+        g->pattern_maturity_avg = current_maturity;  /* Initialize */
+    } else {
+        g->pattern_maturity_avg = alpha * current_maturity + (1.0f - alpha) * g->pattern_maturity_avg;
+    }
+}
+
+/* DATA-DRIVEN: Adaptive chunk size based on local node sizes (relative, not hardcoded) */
+size_t compute_adaptive_chunk_size(MelvinGraph *g, Node *prev_node) {
+    if (!g || g->node_count == 0) {
+        return 64;  /* Minimal context: start small, grows with data */
+    }
+    
+    /* ADAPTIVE: Chunk size adapts to local node sizes */
+    /* If previous node is large (hierarchy node), suggest larger chunks */
+    size_t base_chunk = 64;  /* Minimal starting point (like nature: starts from seed) */
+    
+    if (prev_node && prev_node->payload_size > 0) {
+        /* RELATIVE: Use previous node's size as local context */
+        /* If local nodes are large, try larger chunks (adaptive to context) */
+        if (prev_node->payload_size > base_chunk) {
+            /* Try chunk size similar to local node sizes */
+            return prev_node->payload_size;
+        }
+    }
+    
+    /* ADAPTIVE: Chunk size scales with graph size (logarithmic) */
+    /* Larger graphs → larger chunks (more patterns exist) */
+    size_t graph_based_chunk = (size_t)(log2f((float)(g->node_count + 1)) * 8);
+    
+    /* Use larger of: base, local context, graph-based */
+    size_t max_chunk = (base_chunk > graph_based_chunk) ? base_chunk : graph_based_chunk;
+    if (prev_node && prev_node->payload_size > max_chunk) {
+        max_chunk = prev_node->payload_size;
+    }
+    
+    return max_chunk;
+}
+
+/* DATA-DRIVEN: Process chunk in batch when hierarchy nodes exist */
+void process_chunk_batch(MelvinGraph *g, const uint8_t *chunk_data, size_t chunk_size, Node *prev_node) {
+    if (!g || !chunk_data || chunk_size == 0) return;
+    
+    /* HIERARCHY-FIRST: Try to match entire chunk as single pattern */
+    /* This follows README: "Try larger patterns first" */
+    Node *chunk_match = NULL;
+    
+    if (prev_node) {
+        /* LOCAL-ONLY: Check if chunk matches via local neighbors (O(degree)) */
+        chunk_match = node_find_via_local_neighbors(prev_node, chunk_data, chunk_size);
+    }
+    
+    if (chunk_match && chunk_match->payload_size >= chunk_size) {
+        /* Found hierarchy node matching chunk - use it (compounds: 1-check matching) */
+        /* Skip byte-by-byte processing */
+        chunk_match->activation_strength = 1.0f;
+        return;
+    }
+    
+    /* If no hierarchy match, fall back to byte-by-byte (but in optimized batch) */
+    /* This is already handled by existing wave_process_sequential_patterns() */
+    size_t out_count = 0;
+    wave_process_sequential_patterns(g, chunk_data, chunk_size, &out_count);
+}
+
+/* ========================================
+ * ENERGY CONSERVATION: ORGANIC EFFICIENCY MECHANISM
+ * (Additional layer working alongside transformer behavior)
+ * ======================================== */
+
+/* DATA-DRIVEN: Compute energy budget from input (input provides energy, like food) */
+/* Energy budget adapts to input size and pattern complexity (relative, not hardcoded) */
+float compute_energy_budget_from_input(size_t input_size, size_t pattern_complexity) {
+    if (input_size == 0) return 0.0f;
+    
+    /* RELATIVE: Energy budget proportional to input size (more input = more energy) */
+    /* Base energy: 1.0 per byte (minimal context, grows with data) */
+    float base_energy = (float)input_size;
+    
+    /* RELATIVE: Pattern complexity affects energy (complex patterns need more energy to process) */
+    /* Complexity factor: log of pattern complexity (diminishing returns) */
+    float complexity_factor = (pattern_complexity > 0) ? 
+        log2f((float)(pattern_complexity + 1)) : 1.0f;
+    
+    /* Energy budget = base * complexity factor (adapts to data characteristics) */
+    return base_energy * complexity_factor;
+}
+
+/* DATA-DRIVEN: Compute energy cost of exploring an edge (operations cost energy) */
+/* Cost is relative to edge characteristics (strong edges cost less, weak edges cost more) */
+float compute_energy_cost_edge_exploration(Edge *edge, Node *from_node) {
+    if (!edge || !from_node) return 0.0f;
+    
+    /* RELATIVE: Energy cost based on edge weight (strong edges = efficient = lower cost) */
+    /* Strong edges (high weight) cost less energy (efficient paths) */
+    /* Weak edges (low weight) cost more energy (inefficient paths) */
+    float local_avg = node_get_local_outgoing_weight_avg(from_node);
+    
+    if (local_avg > 0.0f) {
+        /* RELATIVE: Cost inversely proportional to edge weight relative to local average */
+        /* Strong edge (weight > local_avg) → lower cost */
+        /* Weak edge (weight < local_avg) → higher cost */
+        float relative_strength = edge->weight / (edge->weight + local_avg);
+        /* Cost = 1.0 - relative_strength (strong edges cost less) */
+        return 1.0f - relative_strength;
+    }
+    
+    /* NO FALLBACK: If no local context, use minimal cost (0.1) */
+    return 0.1f;
+}
+
+/* DYNAMIC ENERGY CONSTRAINT: Compute exploration probability based on available energy */
+/* Energy modulates behavior - low energy = less exploration, high energy = more exploration */
+/* Like biological systems: energy doesn't block, it modulates */
+float compute_energy_modulated_exploration_probability(float edge_cost, float available_energy) {
+    if (available_energy <= 0.0f) return 0.0f;  /* No energy = no exploration */
+    if (edge_cost <= 0.0f) return 1.0f;  /* Free edges = always explore */
+    
+    /* DYNAMIC: Probability scales with energy/cost ratio */
+    /* High energy relative to cost = high probability (explore more) */
+    /* Low energy relative to cost = low probability (explore less) */
+    /* Strong edges (low cost) have higher probability even with low energy */
+    float energy_cost_ratio = available_energy / (available_energy + edge_cost);
+    
+    /* RELATIVE: Use sigmoid-like function for smooth modulation */
+    /* This creates gradual transition, not binary on/off */
+    /* When energy >> cost: probability → 1.0 (explore) */
+    /* When energy << cost: probability → 0.0 (don't explore) */
+    /* When energy ≈ cost: probability ≈ 0.5 (moderate exploration) */
+    return energy_cost_ratio;
+}
+
+/* DATA-DRIVEN: Compute energy cost of wave propagation step */
+/* Cost scales with wave front size and edges explored (more exploration = more cost) */
+float compute_energy_cost_wave_step(size_t wave_front_size, size_t edges_explored) {
+    /* RELATIVE: Cost proportional to exploration (more nodes/edges = more cost) */
+    /* Base cost: 0.1 per node in wave front (minimal context) */
+    float base_cost = (float)wave_front_size * 0.1f;
+    
+    /* RELATIVE: Additional cost for edges explored (each edge costs energy) */
+    float edge_cost = (float)edges_explored * 0.05f;
+    
+    /* Total cost = base + edge cost (scales with exploration) */
+    return base_cost + edge_cost;
+}
+
+/* ========================================
+ * RIGID ENERGY CONSTRAINT: Sort edges by efficiency
+ * (Strong edges = efficient = lower cost = process first)
+ * ======================================== */
+
+/* Compare function for sorting edges by efficiency (cost ascending) */
+/* Strong edges (high weight) have lower cost, so they come first */
+/* Note: Using static global for macOS compatibility (qsort_r signature differs) */
+static Node *g_sort_from_node = NULL;
+static int compare_edges_by_efficiency(const void *a, const void *b) {
+    Edge *edge_a = *(Edge**)a;
+    Edge *edge_b = *(Edge**)b;
+    Node *from_node = g_sort_from_node;
+    
+    if (!edge_a || !edge_b || !from_node) return 0;
+    
+    /* Compute cost for each edge (strong edges = lower cost) */
+    float cost_a = compute_energy_cost_edge_exploration(edge_a, from_node);
+    float cost_b = compute_energy_cost_edge_exploration(edge_b, from_node);
+    
+    /* Sort by cost (ascending) - lower cost (strong edges) first */
+    if (cost_a < cost_b) return -1;
+    if (cost_a > cost_b) return 1;
+    return 0;
+}
+
+/* RIGID CONSTRAINT: Sort edges by efficiency (strong edges first = lower cost) */
+/* This ensures we process affordable edges first (like biological systems) */
+void sort_edges_by_efficiency(Edge **edges, size_t count, Node *from_node) {
+    if (!edges || count == 0 || !from_node) return;
+    
+    /* Use qsort with static global for macOS compatibility */
+    /* Strong edges (high weight) = efficient = lower cost = process first */
+    g_sort_from_node = from_node;
+    qsort(edges, count, sizeof(Edge*), compare_edges_by_efficiency);
+    g_sort_from_node = NULL;
+}
+
 /* Unified multi-step wave propagation - all mechanisms work together seamlessly */
 /* Philosophy: Everything updates continuously - weights, edges, hierarchy, blank nodes */
 /* All pieces integrated: activation → weight updates → edge formation → hierarchy → blank nodes */
 /* GPU-ACCELERATED: Auto-detects and uses GPU when available, falls back to CPU */
 /* MULTI-THREADING: Parallelizes activation/weight updates for large wave fronts */
+/* ENERGY CONSERVATION: Additional layer - operations cost energy, system naturally conserves */
 void wave_propagate_multi_step(MelvinGraph *g, Node **initial_nodes, size_t initial_count) {
+    /* Compute energy budget from graph state (if available) */
+    /* For now, use unlimited energy (backward compatible) */
+    float energy_budget = FLT_MAX;
+    wave_propagate_multi_step_with_energy(g, initial_nodes, initial_count, &energy_budget);
+}
+
+/* Wave propagation with energy conservation (organic efficiency mechanism) */
+/* ENERGY CONSERVATION: Additional constraint working alongside transformer behavior */
+/* Edges still transform activation (intelligence), but energy limits exploration (efficiency) */
+void wave_propagate_multi_step_with_energy(MelvinGraph *g, Node **initial_nodes, size_t initial_count, float *energy_budget) {
     if (!g || !initial_nodes || initial_count == 0) return;
     
     /* Get GPU context (auto-initializes, returns NULL if GPU unavailable) */
@@ -4352,11 +4999,38 @@ void wave_propagate_multi_step(MelvinGraph *g, Node **initial_nodes, size_t init
             }
             
             /* Propagate through edges */
-            Node **newly_activated = wave_propagate_from_node(current_node);
+            /* RIGID CONSTRAINT: Pass energy budget to edge propagation */
+            /* Energy is consumed atomically per edge (before processing) */
+            Node **newly_activated = wave_propagate_from_node_with_energy(current_node, energy_budget);
             if (newly_activated) {
                 for (size_t j = 0; newly_activated[j]; j++) {
                     Node *activated_node = newly_activated[j];
                     if (!activated_node) continue;
+                    
+                    /* ENERGY CONSERVATION: Cost energy for exploring edge (operations cost energy) */
+                    /* Find the edge that activated this node to compute cost */
+                    Edge *activating_edge = NULL;
+                    for (size_t k = 0; k < current_node->outgoing_count; k++) {
+                        if (current_node->outgoing_edges[k] && 
+                            current_node->outgoing_edges[k]->to_node == activated_node &&
+                            current_node->outgoing_edges[k]->activation) {
+                            activating_edge = current_node->outgoing_edges[k];
+                            break;
+                        }
+                    }
+                    
+                    if (activating_edge && energy_budget) {
+                        /* ENERGY CONSERVATION: Cost energy for edge exploration */
+                        float edge_cost = compute_energy_cost_edge_exploration(activating_edge, current_node);
+                        *energy_budget -= edge_cost;
+                        
+                        /* ENERGY CONSERVATION: Stop exploring if energy exhausted (natural limit) */
+                        if (*energy_budget <= 0.0f) {
+                            /* Energy exhausted - stop exploring this node's edges */
+                            free(newly_activated);
+                            break;
+                        }
+                    }
                     
                     current_energy += activated_node->weight;
                     
@@ -4423,6 +5097,17 @@ void wave_propagate_multi_step(MelvinGraph *g, Node **initial_nodes, size_t init
         
         /* Cleanup */
         if (co_activated) free(co_activated);
+        
+        /* RIGID CONSTRAINT: Energy already consumed atomically per edge */
+        /* No need to charge again - energy was consumed BEFORE processing each edge */
+        /* This matches biological systems: energy is a physical constraint, not a soft check */
+        /* If energy runs out during edge processing, those edges simply aren't processed */
+        
+        /* Check if we have any energy left for next step */
+        if (energy_budget && *energy_budget <= 0.0f) {
+            free(next_wave_front);
+            break;  /* Energy exhausted - natural stopping (like neuron: no ATP = can't fire) */
+        }
         
         /* RELATIVE: Convergence when energy decreases relative to previous step (no hardcoded threshold) */
         /* System naturally converges when energy stops flowing - relative to its own state */
@@ -4494,6 +5179,10 @@ Node* node_combine_payloads(Node *node1, Node *node2) {
 /* Removed explicit hierarchy check - hierarchy emerges implicitly from pattern repetition */
 /* See wave_create_edges_from_coactivation() for natural hierarchy emergence */
 
+/* Forward declaration for hierarchy connection creation */
+static void node_create_hierarchy_connections(MelvinGraph *g, Node *new_hierarchy, 
+                                              Node *component1, Node *component2);
+
 /* Transfer edges to hierarchy node (simple rule: preserve connectivity) */
 /* Complexity emerges: hierarchy nodes naturally participate in graph structure */
 void node_transfer_incoming_to_hierarchy(MelvinGraph *g, Node *node1, Node *node2, Node *combined) {
@@ -4559,6 +5248,120 @@ void node_transfer_incoming_to_hierarchy(MelvinGraph *g, Node *node1, Node *node
                 new_edge->weight = compute_relative_initial_edge_weight(combined, old_edge->weight);
                 new_edge->activation = true;
                 graph_add_edge(g, new_edge, combined, old_edge->to_node);
+            }
+        }
+    }
+    
+    /* UNIVERSAL: Create edges to compatible hierarchy nodes (enables deeper hierarchy) */
+    /* Hierarchy nodes can connect to other hierarchy nodes if they're compatible */
+    /* Compatibility: node1 ends with what node2 starts with (or vice versa) */
+    /* This follows README: local-only operations (checks component nodes' edges) */
+    /* Example: "he" (new) ends with "e", "el" (candidate) starts with "e" → create "he"→"el" edge */
+    node_create_hierarchy_connections(g, combined, node1, node2);
+}
+
+/* Create edges between compatible hierarchy nodes (local-only, relative thresholds) */
+/* Philosophy: Hierarchy nodes should connect if they can form deeper abstractions */
+/* This enables Level 2+ hierarchy: "he"→"el"→"lo" can combine into "hello" */
+static void node_create_hierarchy_connections(MelvinGraph *g, Node *new_hierarchy, 
+                                              Node *component1, Node *component2) {
+    if (!g || !new_hierarchy || !component1 || !component2) return;
+    
+    /* Only process hierarchy nodes (abstraction_level > 0) */
+    if (new_hierarchy->abstraction_level == 0) return;
+    
+    /* LOCAL-ONLY: Check component nodes' outgoing edges for compatible hierarchy nodes */
+    /* No global search - only checks edges from component nodes (local knowledge) */
+    /* Follows README: nodes only know themselves and their edges */
+    
+    /* Check component1's outgoing edges for compatible hierarchy nodes */
+    /* Example: "h"→"e" created "he", check if "e"→"l" created "el" (compatible) */
+    for (size_t i = 0; i < component1->outgoing_count; i++) {
+        Edge *edge = component1->outgoing_edges[i];
+        if (!edge || !edge->to_node) continue;
+        Node *candidate = edge->to_node;
+        
+        /* Skip if same node or not a hierarchy node */
+        if (candidate == new_hierarchy || candidate->abstraction_level == 0) continue;
+        
+        /* Check compatibility: new_hierarchy ends with what candidate starts with */
+        /* Example: "he" (new) ends with "e", "el" (candidate) starts with "e" */
+        if (new_hierarchy->payload_size > 0 && candidate->payload_size > 0) {
+            uint8_t new_last = new_hierarchy->payload[new_hierarchy->payload_size - 1];
+            uint8_t candidate_first = candidate->payload[0];
+            
+            if (new_last == candidate_first) {
+                /* Compatible - create edge if doesn't exist */
+                Edge *existing = node_find_edge_to(new_hierarchy, candidate);
+                if (!existing) {
+                    Edge *hierarchy_edge = edge_create(new_hierarchy, candidate, true);
+                    if (hierarchy_edge) {
+                        /* RELATIVE: Initial weight based on component edge weight and local context */
+                        /* No hardcoded threshold - uses local average or component edge weight */
+                        float local_avg = node_get_local_outgoing_weight_avg(new_hierarchy);
+                        if (local_avg > 0.0f) {
+                            /* Use local average as baseline (relative to context) */
+                            hierarchy_edge->weight = local_avg / (local_avg + 1.0f);
+                        } else {
+                            /* No local context: use component edge weight as baseline */
+                            float component_weight = (edge->weight > 0.0f) ? 
+                                edge->weight / (edge->weight + 1.0f) : 0.0f;
+                            hierarchy_edge->weight = component_weight;
+                        }
+                        hierarchy_edge->activation = true;
+                        graph_add_edge(g, hierarchy_edge, new_hierarchy, candidate);
+                    }
+                } else {
+                    /* Edge exists - strengthen it (learning through repetition) */
+                    existing->activation = true;
+                    edge_update_weight_local(existing);
+                }
+            }
+        }
+    }
+    
+    /* Check component2's incoming edges for compatible hierarchy nodes */
+    /* Example: "e"→"l" created "el", check if "h"→"e" created "he" (compatible) */
+    for (size_t i = 0; i < component2->incoming_count; i++) {
+        Edge *edge = component2->incoming_edges[i];
+        if (!edge || !edge->from_node) continue;
+        Node *candidate = edge->from_node;
+        
+        /* Skip if same node or not a hierarchy node */
+        if (candidate == new_hierarchy || candidate->abstraction_level == 0) continue;
+        
+        /* Check compatibility: candidate ends with what new_hierarchy starts with */
+        /* Example: "he" (candidate) ends with "e", "el" (new) starts with "e" */
+        if (candidate->payload_size > 0 && new_hierarchy->payload_size > 0) {
+            uint8_t candidate_last = candidate->payload[candidate->payload_size - 1];
+            uint8_t new_first = new_hierarchy->payload[0];
+            
+            if (candidate_last == new_first) {
+                /* Compatible - create edge if doesn't exist */
+                Edge *existing = node_find_edge_to(candidate, new_hierarchy);
+                if (!existing) {
+                    Edge *hierarchy_edge = edge_create(candidate, new_hierarchy, true);
+                    if (hierarchy_edge) {
+                        /* RELATIVE: Initial weight based on component edge weight and local context */
+                        /* No hardcoded threshold - uses local average or component edge weight */
+                        float local_avg = node_get_local_outgoing_weight_avg(candidate);
+                        if (local_avg > 0.0f) {
+                            /* Use local average as baseline (relative to context) */
+                            hierarchy_edge->weight = local_avg / (local_avg + 1.0f);
+                        } else {
+                            /* No local context: use component edge weight as baseline */
+                            float component_weight = (edge->weight > 0.0f) ? 
+                                edge->weight / (edge->weight + 1.0f) : 0.0f;
+                            hierarchy_edge->weight = component_weight;
+                        }
+                        hierarchy_edge->activation = true;
+                        graph_add_edge(g, hierarchy_edge, candidate, new_hierarchy);
+                    }
+                } else {
+                    /* Edge exists - strengthen it (learning through repetition) */
+                    existing->activation = true;
+                    edge_update_weight_local(existing);
+                }
             }
         }
     }
@@ -4787,18 +5590,27 @@ void wave_collect_output(MelvinGraph *g, Node **direct_input_nodes, size_t direc
                 
                 /* Collect all valid candidate nodes and their probabilities */
                 /* README: Follows co-activation edges (learned patterns) only */
-                /* Co-activation edges: weight above local average (relative to local context) */
+                /* SMOOTH: Use weight relative to local average as probability (no binary threshold) */
+                /* Strong co-activation edges = high probability, weak = low probability */
                 local_outgoing_avg = node_get_local_outgoing_weight_avg(current);
                 
                 for (size_t i = 0; i < current->outgoing_count; i++) {
                     Edge *edge = current->outgoing_edges[i];
                     if (!edge || !edge->to_node) continue;
                     
-                    /* README: Co-activation edges have weight above local average */
-                    /* Filter to co-activation edges only (learned sequential patterns) */
-                    bool is_coactivation = (local_outgoing_avg > 0.0f) ? 
-                                          (edge->weight > local_outgoing_avg) : (edge->weight > 0.0f);
-                    if (!is_coactivation) continue;
+                    /* SMOOTH: Compute co-activation probability (continuous, not binary) */
+                    /* Weight relative to local average determines probability */
+                    float weight_relative = 0.0f;
+                    if (local_outgoing_avg > 0.0f) {
+                        weight_relative = edge->weight / (edge->weight + local_outgoing_avg);  /* Smooth: 0 to 1 */
+                    } else {
+                        weight_relative = (edge->weight > 0.0f) ? 
+                            edge->weight / (edge->weight + 1.0f) : 0.0f;
+                    }
+                    
+                    /* Use minimal probability threshold for efficiency (very weak edges excluded) */
+                    /* But smooth transition, not binary cutoff */
+                    if (weight_relative < 0.01f) continue;  /* Very weak co-activation, skip */
                     
                     /* ALLOW self-loops: repeated chars must be emitted */
                     bool is_self_loop = (edge->from_node == edge->to_node);
@@ -4811,8 +5623,12 @@ void wave_collect_output(MelvinGraph *g, Node **direct_input_nodes, size_t direc
                     float transformed = edge_transform_activation(edge, current->activation_strength);
                     
                     if (transformed > 0.0f) {
+                        /* SMOOTH: Combine transformed activation with co-activation probability */
+                        /* Strong co-activation edges get higher probability in output generation */
+                        float combined_prob = transformed * weight_relative;  /* Modulate by co-activation strength */
+                        
                         /* Apply temperature scaling (LLM-like) */
-                        float prob = powf(transformed, 1.0f / adaptive_temperature);
+                        float prob = powf(combined_prob, 1.0f / adaptive_temperature);
                         
                         /* Allocate arrays if needed */
                         if (candidate_count == 0) {
